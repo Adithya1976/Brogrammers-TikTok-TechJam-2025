@@ -1,0 +1,17 @@
+{
+  "id": "2025-08-28T11-11-26_040961_photo_2025-08-28_11-10-57_jpg",
+  "timestamp": "2025-08-28T11:11:26.040961",
+  "filename": "photo_2025-08-28_11-10-57.jpg",
+  "result": {
+    "ocr_text": "1\n8\n8",
+    "privacy_score": 0,
+    "is_safe": true,
+    "entities": [],
+    "detailed_entities": [],
+    "processing_time": 4.65,
+    "ocr_time": 4.56,
+    "analysis_time": 0.08,
+    "filename": "photo_2025-08-28_11-10-57.jpg",
+    "file_type": "image"
+  }
+}

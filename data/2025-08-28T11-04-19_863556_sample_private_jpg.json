@@ -1,0 +1,55 @@
+{
+  "id": "2025-08-28T11-04-19_863556_sample_private_jpg",
+  "timestamp": "2025-08-28T11:04:19.863556",
+  "filename": "sample_private.jpg",
+  "result": {
+    "ocr_text": "Contact johndce@emailcom\nPhone: (5551 123-4567\nSSN: 123-45-6789",
+    "privacy_score": 10,
+    "is_safe": false,
+    "entities": [
+      "EMAIL_ADDRESS",
+      "PHONE_NUMBER",
+      "URL",
+      "URL"
+    ],
+    "detailed_entities": [
+      {
+        "type": "EMAIL_ADDRESS",
+        "confidence": 1.0,
+        "start": 8,
+        "end": 26,
+        "text": "john.doe@email.com",
+        "risk_level": "high"
+      },
+      {
+        "type": "PHONE_NUMBER",
+        "confidence": 0.75,
+        "start": 34,
+        "end": 48,
+        "text": "(555) 123-4567",
+        "risk_level": "high"
+      },
+      {
+        "type": "URL",
+        "confidence": 0.5,
+        "start": 8,
+        "end": 15,
+        "text": "john.do",
+        "risk_level": "medium"
+      },
+      {
+        "type": "URL",
+        "confidence": 0.5,
+        "start": 17,
+        "end": 26,
+        "text": "email.com",
+        "risk_level": "medium"
+      }
+    ],
+    "processing_time": 0.57,
+    "ocr_time": 0.32,
+    "analysis_time": 0.25,
+    "filename": "sample_private.jpg",
+    "file_type": "image"
+  }
+}

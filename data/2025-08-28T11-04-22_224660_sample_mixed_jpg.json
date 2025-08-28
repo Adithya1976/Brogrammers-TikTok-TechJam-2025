@@ -1,0 +1,46 @@
+{
+  "id": "2025-08-28T11-04-22_224660_sample_mixed_jpg",
+  "timestamp": "2025-08-28T11:04:22.224660",
+  "filename": "sample_mixed.jpg",
+  "result": {
+    "ocr_text": "Callus (5551 999-8888\nEmail info@restaurantcom",
+    "privacy_score": 9,
+    "is_safe": false,
+    "entities": [
+      "EMAIL_ADDRESS",
+      "URL",
+      "PHONE_NUMBER"
+    ],
+    "detailed_entities": [
+      {
+        "type": "EMAIL_ADDRESS",
+        "confidence": 1.0,
+        "start": 29,
+        "end": 48,
+        "text": "info@restaurant.com",
+        "risk_level": "high"
+      },
+      {
+        "type": "URL",
+        "confidence": 0.5,
+        "start": 34,
+        "end": 48,
+        "text": "restaurant.com",
+        "risk_level": "medium"
+      },
+      {
+        "type": "PHONE_NUMBER",
+        "confidence": 0.4,
+        "start": 8,
+        "end": 22,
+        "text": "(555) 999-8888",
+        "risk_level": "high"
+      }
+    ],
+    "processing_time": 0.32,
+    "ocr_time": 0.31,
+    "analysis_time": 0.01,
+    "filename": "sample_mixed.jpg",
+    "file_type": "image"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "id": "2025-08-28T02-20-30_980204_sample_private_jpg",
+  "timestamp": "2025-08-28T02:20:30.980204",
+  "filename": "sample_private.jpg",
+  "result": {
+    "ocr_text": "",
+    "privacy_score": 0,
+    "is_safe": true,
+    "entities": [],
+    "detailed_entities": [],
+    "processing_time": 0.01,
+    "ocr_time": 0.01,
+    "analysis_time": 0.0,
+    "filename": "sample_private.jpg",
+    "file_type": "image"
+  }
+}

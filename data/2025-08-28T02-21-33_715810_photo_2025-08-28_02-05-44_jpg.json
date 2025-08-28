@@ -1,0 +1,64 @@
+{
+  "id": "2025-08-28T02-21-33_715810_photo_2025-08-28_02-05-44_jpg",
+  "timestamp": "2025-08-28T02:21:33.715810",
+  "filename": "photo_2025-08-28_02-05-44.jpg",
+  "result": {
+    "ocr_text": "Business Card\nDr. Michael Johnson\nCardiologist\nPhone: (555) 234-5678\nEmail: m.johnson@healthcenter.com\nLicense: MD987654321\nOffice: 456 Medical Plaza, Suite 200",
+    "privacy_score": 10,
+    "is_safe": false,
+    "entities": [
+      "EMAIL_ADDRESS",
+      "PERSON",
+      "PHONE_NUMBER",
+      "URL",
+      "URL"
+    ],
+    "detailed_entities": [
+      {
+        "type": "EMAIL_ADDRESS",
+        "confidence": 1.0,
+        "start": 76,
+        "end": 102,
+        "text": "m.johnson@healthcenter.com",
+        "risk_level": "high"
+      },
+      {
+        "type": "PERSON",
+        "confidence": 0.85,
+        "start": 18,
+        "end": 33,
+        "text": "Michael Johnson",
+        "risk_level": "high"
+      },
+      {
+        "type": "PHONE_NUMBER",
+        "confidence": 0.75,
+        "start": 54,
+        "end": 68,
+        "text": "(555) 234-5678",
+        "risk_level": "high"
+      },
+      {
+        "type": "URL",
+        "confidence": 0.5,
+        "start": 76,
+        "end": 80,
+        "text": "m.jo",
+        "risk_level": "medium"
+      },
+      {
+        "type": "URL",
+        "confidence": 0.5,
+        "start": 86,
+        "end": 102,
+        "text": "healthcenter.com",
+        "risk_level": "medium"
+      }
+    ],
+    "processing_time": 0.25,
+    "ocr_time": 0.05,
+    "analysis_time": 0.2,
+    "filename": "photo_2025-08-28_02-05-44.jpg",
+    "file_type": "image"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "id": "2025-08-28T02-14-02_436497_sample_mixed_jpg",
+  "timestamp": "2025-08-28T02:14:02.436497",
+  "filename": "sample_mixed.jpg",
+  "result": {
+    "ocr_text": "",
+    "privacy_score": 0,
+    "is_safe": true,
+    "entities": [],
+    "detailed_entities": [],
+    "processing_time": 0.0,
+    "ocr_time": 0.0,
+    "analysis_time": 0.0,
+    "filename": "sample_mixed.jpg",
+    "file_type": "image"
+  }
+}

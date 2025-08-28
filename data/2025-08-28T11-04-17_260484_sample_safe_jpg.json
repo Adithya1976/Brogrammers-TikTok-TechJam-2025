@@ -1,0 +1,28 @@
+{
+  "id": "2025-08-28T11-04-17_260484_sample_safe_jpg",
+  "timestamp": "2025-08-28T11:04:17.260484",
+  "filename": "sample_safe.jpg",
+  "result": {
+    "ocr_text": "Welcome\nOpen 9AM-SPM",
+    "privacy_score": 0,
+    "is_safe": true,
+    "entities": [
+      "DATE_TIME"
+    ],
+    "detailed_entities": [
+      {
+        "type": "DATE_TIME",
+        "confidence": 0.85,
+        "start": 13,
+        "end": 20,
+        "text": "9AM-SPM",
+        "risk_level": "low"
+      }
+    ],
+    "processing_time": 0.58,
+    "ocr_time": 0.46,
+    "analysis_time": 0.12,
+    "filename": "sample_safe.jpg",
+    "file_type": "image"
+  }
+}

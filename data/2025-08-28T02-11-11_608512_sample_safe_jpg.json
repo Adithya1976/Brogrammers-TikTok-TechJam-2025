@@ -1,0 +1,17 @@
+{
+  "id": "2025-08-28T02-11-11_608512_sample_safe_jpg",
+  "timestamp": "2025-08-28T02:11:11.608512",
+  "filename": "sample_safe.jpg",
+  "result": {
+    "ocr_text": "",
+    "privacy_score": 0,
+    "is_safe": true,
+    "entities": [],
+    "detailed_entities": [],
+    "processing_time": 0.02,
+    "ocr_time": 0.02,
+    "analysis_time": 0.0,
+    "filename": "sample_safe.jpg",
+    "file_type": "image"
+  }
+}
