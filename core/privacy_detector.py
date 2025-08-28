@@ -1,12 +1,18 @@
+from textwrap import indent
+import traceback
 import cv2
 import numpy as np
 from PIL import Image
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from typing import List, Dict, Tuple
 import io
 import time
+import json
 import re
+
+from sympy import im
 
 # Use EasyOCR as primary OCR backend
 try:
@@ -25,7 +31,7 @@ class PrivacyDetector:
         self.ocr_reader = None
         
         # Check GPU availability
-        self.gpu_available = torch.cuda.is_available() if OCR_BACKEND == 'easyocr' else False
+        self.gpu_available = torch.cuda.is_available() or torch.mps.is_available()
         
         # Initialize EasyOCR
         self.ocr_backend = OCR_BACKEND
@@ -38,8 +44,128 @@ class PrivacyDetector:
                 print(f"⚠️ EasyOCR initialization failed: {e}")
                 self.ocr_backend = 'demo'
                 print("⚠️ Falling back to demo mode")
+        elif self.ocr_backend == "trocr":
+            self.trocr_processor = TrOCRProcessor.from_pretrained('microsoft/trocr-large-printed', use_fast=True)
+            self.trocr_model = VisionEncoderDecoderModel.from_pretrained('microsoft/trocr-large-printed').to('cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
         else:
             print("⚠️ Using demo mode for OCR")
+    
+    def high_contrast_grayscale(self, image) -> np.ndarray:
+        """
+        Load an image, convert it to a light-background, dark-text grayscale
+        suitable for OCR.
+        """
+        # # 1. Read and resize for faster processing (optional)
+        # h, w = img.shape[:2]
+        # max_dim = 1024
+        # if max(h, w) > max_dim:
+        #     scale = max_dim / max(h, w)
+        #     img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Convert to numpy array
+        img = np.array(image)
+
+        # 2. Convert to LAB color space to isolate luminance
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+
+        # 3. Apply CLAHE to L channel: boosts local contrast without over-amplifying noise
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l_clahe = clahe.apply(l)
+
+        # 4. Merge CLAHE L channel back and convert to BGR then grayscale
+        lab_clahe = cv2.merge((l_clahe, a, b))
+        bgr_clahe = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+        gray = cv2.cvtColor(bgr_clahe, cv2.COLOR_BGR2GRAY)
+
+        # 5. Normalize intensities to ensure text is dark and background light
+        #    We scale pixel values so that the 5th percentile maps to ~220 (light),
+        #    and the 95th percentile to ~30 (dark).
+        p5, p95 = np.percentile(gray, (5, 95))
+        gray_norm = np.clip((gray - p5) * (255.0 / (p95 - p5)), 0, 255).astype(np.uint8)
+        gray_inv = cv2.bitwise_not(gray_norm)  # invert so text (dark originally) becomes black
+
+        # 6. Optional: apply a light Gaussian blur to smooth noise
+        gray_final = cv2.GaussianBlur(gray_inv, (3, 3), 0)
+
+        return gray_final
+
+    def unify_text_to_black(self, image) -> None:
+        """
+        Loads an image of a card with mixed-color text, and outputs
+        a uniform light-gray background with all text rendered in black.
+        """
+        # 1. Read and downscale for speed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Convert to numpy array
+        img = np.array(image)
+        
+        h, w = img.shape[:2]
+        max_dim = 1024
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            img = cv2.resize(img, (int(w*scale), int(h*scale)))
+
+        # 2. Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # 3. Estimate background by large closing (fills text regions)
+        #    Kernel size should exceed typical text height
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (51, 51))
+        background = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+
+        # 4. Subtract background to emphasize text (both dark & light)
+        #    This yields bright text where original was darker and vice versa
+        diff = cv2.absdiff(background, gray)
+
+        # 5. Normalize and threshold to obtain a binary mask of text strokes
+        norm = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+        _, text_mask = cv2.threshold(norm, 0, 255,
+                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # 6. Dilate the mask slightly to fill gaps in text strokes
+        dilate_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        text_mask = cv2.dilate(text_mask, dilate_k, iterations=1)
+
+        # 7. Create a uniform light-gray background
+        #    Pick the median of the estimated background for consistency
+        bg_color = int(np.median(background))
+        uniform_bg = np.full_like(gray, bg_color)
+
+        # 8. Paint text pixels black onto the uniform background
+        result = uniform_bg.copy()
+        result[text_mask == 255] = 0  # text → black
+
+        # 9. Save the preprocessed image
+        return result
+
+    def preprocess_mobile_photo_background_subtract(self, image_cv: np.ndarray) -> np.ndarray:
+        # (same as before)
+        if image_cv.ndim == 3:
+            img = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
+        else:
+            img = image_cv
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(img)
+        bg = cv2.GaussianBlur(enhanced, (51,51), 0)
+        normalized = cv2.divide(enhanced, bg, scale=255)
+        mean_val = normalized.mean()
+        invert = mean_val < 127
+        thresh_type = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+        binary = cv2.adaptiveThreshold(
+            normalized, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, thresh_type,
+            blockSize=15, C=7
+        )
+        if invert:
+            binary = cv2.bitwise_not(binary)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
+        return cv2.dilate(binary, kernel, iterations=1)
         
     def extract_text_from_image(self, image_bytes: bytes, filename: str = None) -> str:
         """Extract text from image using EasyOCR"""
@@ -47,37 +173,55 @@ class PrivacyDetector:
             image = Image.open(io.BytesIO(image_bytes))
             
             if self.ocr_backend == 'easyocr' and self.ocr_reader:
+                print("🔍 Running EasyOCR..."   )
                 # Preprocess image for better OCR results
-                image_np = self._preprocess_image_for_easyocr(image)
+                # image_np = self._preprocess_image_for_easyocr(image)
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
+                image_np = np.array(image)
                 
+                # rotate image clockwise
+                image_np = cv2.rotate(image_np, cv2.ROTATE_90_CLOCKWISE)
+
+                # print shape of image
+                print(f"Image shape after pre-process: {image_np.shape}")
+
+                # store image for debugging
+                cv2.imwrite("debug_image.png", cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
+
                 # Run EasyOCR with optimized settings for cards/documents
                 results = self.ocr_reader.readtext(
-                    image_np,
-                    detail=1,  # Return detailed results with confidence
-                    paragraph=False,  # Don't group into paragraphs
-                    width_ths=0.7,  # Text width threshold
-                    height_ths=0.7,  # Text height threshold
-                    decoder='greedy'  # Use greedy decoder for speed
+                    image_np
                 )
                 
-                # Extract text with lower confidence threshold for cards
-                text_parts = []
+                parts, boxes = [], []
                 for bbox, text, confidence in results:
-                    if confidence > 0.2 and len(text.strip()) > 0:  # Very low threshold for cards
-                        text_parts.append(text.strip())
-                
-                extracted_text = '\n'.join(text_parts)
-                print(f"🔍 EasyOCR extracted: {extracted_text[:100]}..." if extracted_text else "🔍 No text extracted")
-                return extracted_text
-                
-            else:
-                # Demo mode - return realistic test data based on filename
-                return self._get_demo_text(filename)
-                
+                    t = (text or "").strip()
+                    if confidence > 0.4 and t:
+                        parts.append(t)
+                        boxes.append(bbox)
+
+                span_to_bb = {}
+                extracted_chunks = []
+                pos = 0  # running char position in the final string
+
+                for i, (t, bb) in enumerate(zip(parts, boxes)):
+                    if i > 0:
+                        # account for the single space inserted by `' '.join`
+                        extracted_chunks.append(" ")
+                        pos += 1
+                    start = pos
+                    extracted_chunks.append(t)
+                    pos += len(t)
+                    # map (start, end+1) -> bbox
+                    span_to_bb[(start, pos)] = bb
+
+                return ''.join(extracted_chunks), span_to_bb
+            
         except Exception as e:
             print(f"OCR Error: {e}")
+            traceback.print_exc()
             # Fallback to demo mode
-            return self._get_demo_text(filename)
     
     def _preprocess_image_for_easyocr(self, image: Image.Image) -> np.ndarray:
         """Preprocess image to improve EasyOCR accuracy for cards/documents"""
@@ -88,81 +232,24 @@ class PrivacyDetector:
         # Convert to numpy array
         image_np = np.array(image)
         
-        # Resize if too large (EasyOCR works better with reasonable sizes)
-        height, width = image_np.shape[:2]
-        max_dimension = 1280
-        
-        if max(height, width) > max_dimension:
-            scale = max_dimension / max(height, width)
-            new_width = int(width * scale)
-            new_height = int(height * scale)
-            image_np = cv2.resize(image_np, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
-        
         # Enhance contrast for better text recognition
         lab = cv2.cvtColor(image_np, cv2.COLOR_RGB2LAB)
         l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4))  # Increased clipLimit, smaller tiles
         l = clahe.apply(l)
         enhanced = cv2.merge([l, a, b])
         image_np = cv2.cvtColor(enhanced, cv2.COLOR_LAB2RGB)
         
         return image_np
     
-
-    
-    def _get_demo_text(self, filename: str = None) -> str:
-        """Generate realistic demo text for testing when OCR is not available"""
-        if not filename:
-            return "Demo text: Contact john.doe@email.com or call (555) 123-4567"
-            
-        filename_lower = filename.lower()
-        
-        # More realistic demo text based on filename patterns
-        if "safe" in filename_lower:
-            return "Welcome to our store!\nOpen Monday-Friday 9AM - 5PM\nSaturday 10AM - 3PM\nClosed Sundays"
-            
-        elif "private" in filename_lower:
-            return """Personal Information
-Name: John Smith
-Email: john.smith@email.com
-Phone: (555) 123-4567
-SSN: 123-45-6789
-Address: 123 Main St, Anytown, NY 12345
-Credit Card: 4532-1234-5678-9012
-Driver License: D123456789"""
-            
-        elif "mixed" in filename_lower:
-            return """Downtown Restaurant
-Delicious Italian Cuisine
-Reservations: (555) 999-8888
-Email: info@restaurant.com
-Manager: Sarah Johnson
-Staff ID: EMP001234
-Emergency Contact: (555) 911-0000"""
-            
-        else:
-            # Default case - assume it might contain some private info for testing
-            return """Business Card
-Dr. Michael Johnson
-Cardiologist
-Phone: (555) 234-5678
-Email: m.johnson@healthcenter.com
-License: MD987654321
-Office: 456 Medical Plaza, Suite 200"""
-    
     def analyze_privacy(self, text: str) -> Dict:
         """Analyze text for privacy-sensitive information"""
         if not text:
             return {"entities": [], "score": 0, "is_safe": True}
         
-        # Clean up OCR text for better analysis
-        cleaned_text = self._clean_ocr_text(text)
-        
+        # text = text.replace("/", " ")
         # Run Presidio analysis
-        results = self.analyzer.analyze(text=cleaned_text, language='en')
-        
-        # Add custom card pattern detection
-        card_patterns = self._detect_card_patterns(cleaned_text)
+        results = self.analyzer.analyze(text=text, language='en')
         
         # Define which entity types are actually privacy-sensitive
         HIGH_RISK_ENTITIES = {
@@ -204,76 +291,14 @@ Office: 456 Medical Plaza, Suite 200"""
             
             entities.append({
                 "type": entity_type,
-                "confidence": confidence,
                 "start": result.start,
                 "end": result.end,
-                "text": cleaned_text[result.start:result.end],
-                "risk_level": "high" if entity_type in HIGH_RISK_ENTITIES else 
-                             "medium" if entity_type in MEDIUM_RISK_ENTITIES else "low"
+                "text": text[result.start:result.end],
             })
-        
-        # Add custom card patterns
-        for pattern in card_patterns:
-            entity_type = pattern["type"]
-            confidence = pattern["confidence"]
-            
-            if entity_type in HIGH_RISK_ENTITIES:
-                weight = 3.0
-            else:
-                weight = 2.0
-            
-            entity_score = confidence * weight
-            privacy_score += entity_score
-            
-            entities.append(pattern)
-        
-        # Boost score if we detect card-like content
-        card_indicators = ['VISA', 'MASTERCARD', 'DBS', 'PLATINUM', 'CARD', 'MULTI-CURRENCY', 'EXPIRES', 'VALID', 'ISSUED']
-        if any(indicator in cleaned_text.upper() for indicator in card_indicators):
-            privacy_score += 3.0
-            print(f"🔍 Card indicator detected in text: {cleaned_text[:100]}...")
-        
-        # Check for numeric patterns that suggest cards/IDs
-        if re.search(r'\d{4}[\s-]*\d{4}[\s-]*\d{4}[\s-]*\d{4}', cleaned_text):  # Credit card pattern
-            privacy_score += 4.0
-            print("🔍 Credit card number pattern detected")
-        
-        if re.search(r'\d{2}/\d{2}/\d{4}', cleaned_text):  # Date pattern (expiry/birth)
-            privacy_score += 1.0
-            print("🔍 Date pattern detected")
-        
-        # Normalize score to 0-10 scale
-        final_score = min(10, int(privacy_score * 1.2)) if (entities or privacy_score > 0) else 0
-        
-        return {
-            "entities": entities,
-            "score": final_score,
-            "is_safe": final_score < 4  # More reasonable threshold
-        }
+            print(f"Detected entity: {entity_type} ({text[result.start:result.end]})")
     
-    def _clean_ocr_text(self, text: str) -> str:
-        """Clean up OCR text to improve entity recognition"""
-        # Common OCR corrections
-        cleaned = text
         
-        # Fix common OCR mistakes in emails
-        cleaned = re.sub(r'(\w+)dce@(\w+)com', r'\1.doe@\2.com', cleaned)
-        cleaned = re.sub(r'(\w+)@(\w+)com', r'\1@\2.com', cleaned)
-        cleaned = re.sub(r'info@restaurant(\w+)', r'info@restaurant.\1', cleaned)
-        
-        # Fix phone number patterns
-        cleaned = re.sub(r'\((\d{3,4})\s*(\d{3})-(\d{4})', r'(\1) \2-\3', cleaned)
-        cleaned = re.sub(r'(\d{3,4})\s+(\d{3})-(\d{4})', r'(\1) \2-\3', cleaned)
-        
-        # Fix common character substitutions
-        cleaned = cleaned.replace('5551', '555')
-        cleaned = cleaned.replace('Callus', 'Call us')
-        
-        # Fix credit card number patterns (common OCR mistakes)
-        cleaned = re.sub(r'(\d{4})\s*[^\d\s]\s*(\d{4})\s*[^\d\s]\s*(\d{4})\s*[^\d\s]\s*(\d{4})', r'\1 \2 \3 \4', cleaned)
-        cleaned = re.sub(r'(\d{4})(\d{4})(\d{4})(\d{4})', r'\1 \2 \3 \4', cleaned)
-        
-        return cleaned
+        return entities
     
     def _detect_card_patterns(self, text: str) -> List[Dict]:
         """Detect specific card patterns that might be missed by Presidio"""
@@ -326,28 +351,90 @@ Office: 456 Medical Plaza, Suite 200"""
         return patterns
     
     def process_image(self, image_bytes: bytes, filename: str = None) -> Dict:
-        """Complete privacy analysis pipeline for images with performance tracking"""
-        start_time = time.time()
+        try:
+            """Complete privacy analysis pipeline for images with performance tracking"""
+            start_time = time.time()
+            result = []
+            
+            # Extract text
+            ocr_start = time.time()
+            image = Image.open(io.BytesIO(image_bytes))
+            shape = image.size
+            ocr_text, span_to_bb = self.extract_text_from_image(image_bytes, filename)
+            ocr_time = time.time() - ocr_start
+            
+            print(f"OCR Text: '{ocr_text}'")
+            # Analyze privacy
+            analysis_start = time.time()
+            detection_list = self.analyze_privacy(ocr_text)
+            analysis_time = time.time() - analysis_start
+
+            mask_list = []
+
+            # print span_to_bb keys and text for debugging
+            print("Span to BB mapping:")
+            for (s, e), bb in span_to_bb.items():
+                print(f"  ({s}, {e}): ocr_text='{ocr_text[s:e]}'")
+
+
+            # map bounding boxes to entities
+            for detection in detection_list:
+                start, end = detection['start'], detection['end']
+                text = detection['text']
+                target_entity = detection['type']
+                # get all keys in span_to_bb that lie within (start, end)
+                bb_list = [bb for (s, e), bb in span_to_bb.items() if s >= start and e <= end]
+
+                for bb in bb_list:
+                    # convert bb to image mask
+                    mask = self.convert_bb_to_mask(bb, shape)
+                    mask_list.append(mask)
+
+                    result.append({
+                        "text": text,
+                        "bounding_box": bb,
+                        "entity_type": target_entity,
+                        "mask": mask.tolist()
+                    })
+
+            combined_mask = self.combined_mask(mask_list, shape)
+            
+            # mask the image out and save for debugging
+            image_np = np.array(image)
+            # rotate image clockwise
+            image_np = cv2.rotate(image_np, cv2.ROTATE_90_CLOCKWISE)
+            print(image_np.shape)
+            print(combined_mask.shape)
+            masked_image = image_np.copy()
+            masked_image[combined_mask == 1] = 0
+            cv2.imwrite("debug_masked_image.png", cv2.cvtColor(masked_image, cv2.COLOR_RGB2BGR))
+
+            # print result's text and entity type
+            for res in result:
+                print(f"Text: {res['text']}, Entity Type: {res['entity_type']}")
+            total_time = time.time() - start_time
+        except Exception as e:
+            print(f"Processing Error: {e}")
+            traceback.print_exc()
+            return {}
+
+    def convert_bb_to_mask(self, bb: List[List[np.float64]], image_shape: Tuple[int, int] = (1024, 1024)) -> np.ndarray:
+        """Convert bounding box to binary mask"""
+        mask = np.zeros(image_shape, dtype=np.uint8)
+        pts = np.array(bb, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(mask, [pts], 1)
+
+        # save mask for debugging
+        cv2.imwrite("debug_mask.png", mask * 255)
+
+        return mask
+
+    def combined_mask(self, masks: List[np.ndarray], shape: Tuple[int, int]) -> np.ndarray:
+        """Combine multiple binary masks into one"""
+        combined = np.zeros(shape, dtype=np.uint8)
+        for mask in masks:
+            combined = np.maximum(combined, mask)
+        # save combined mask for debugging
+        cv2.imwrite("debug_combined_mask.png", combined * 255)
+        return combined
         
-        # Extract text
-        ocr_start = time.time()
-        ocr_text = self.extract_text_from_image(image_bytes, filename)
-        ocr_time = time.time() - ocr_start
-        
-        # Analyze privacy
-        analysis_start = time.time()
-        privacy_analysis = self.analyze_privacy(ocr_text)
-        analysis_time = time.time() - analysis_start
-        
-        total_time = time.time() - start_time
-        
-        return {
-            "ocr_text": ocr_text,
-            "privacy_score": privacy_analysis["score"],
-            "is_safe": privacy_analysis["is_safe"],
-            "entities": [e["type"] for e in privacy_analysis["entities"]],
-            "detailed_entities": privacy_analysis["entities"],
-            "processing_time": round(total_time, 2),
-            "ocr_time": round(ocr_time, 2),
-            "analysis_time": round(analysis_time, 2)
-        }

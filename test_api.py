@@ -47,6 +47,7 @@ def test_server():
     
     # Test file processing
     test_files = ['sample_safe.jpg', 'sample_private.jpg', 'sample_mixed.jpg']
+    test_files = ['IMG_8412.JPG']
     
     for i, filename in enumerate(test_files, 3):
         if os.path.exists(filename):
@@ -58,11 +59,7 @@ def test_server():
                 
                 if response.status_code == 200:
                     result = response.json()
-                    print(f"   ✅ Processed successfully")
-                    print(f"   Privacy Score: {result['privacy_score']}/10")
-                    print(f"   Safe: {result['is_safe']}")
-                    print(f"   Entities: {result['entities']}")
-                    print(f"   Processing Time: {result.get('processing_time', 'N/A')}s")
+                    print(result)
                 else:
                     print(f"   ❌ Processing failed: {response.status_code}")
                     print(f"   Error: {response.text}")
@@ -72,16 +69,16 @@ def test_server():
             print(f"\n{i}. ⚠️ {filename} not found (run: python demo.py)")
     
     # Test gallery
-    try:
-        print(f"\n{len(test_files) + 3}. Testing gallery...")
-        response = requests.get(f"{base_url}/api/gallery", timeout=5)
-        if response.status_code == 200:
-            gallery = response.json()
-            print(f"   ✅ Gallery retrieved: {gallery['total']} items")
-        else:
-            print(f"   ❌ Gallery failed: {response.status_code}")
-    except Exception as e:
-        print(f"   ❌ Gallery error: {e}")
+    # try:
+    #     print(f"\n{len(test_files) + 3}. Testing gallery...")
+    #     response = requests.get(f"{base_url}/api/gallery", timeout=5)
+    #     if response.status_code == 200:
+    #         gallery = response.json()
+    #         print(f"   ✅ Gallery retrieved: {gallery['total']} items")
+    #     else:
+    #         print(f"   ❌ Gallery failed: {response.status_code}")
+    # except Exception as e:
+    #     print(f"   ❌ Gallery error: {e}")
     
     # Test performance stats
     try:

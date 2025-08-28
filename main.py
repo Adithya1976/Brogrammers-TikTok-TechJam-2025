@@ -1,3 +1,4 @@
+import traceback
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -35,7 +36,7 @@ noise_generator = AdversarialNoiseGenerator()
 storage = ProcessingResult()
 
 # Mount static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -280,18 +281,10 @@ async def process_file(file: UploadFile = File(...)):
         # Process based on file type
         if file.content_type.startswith('image/'):
             result = privacy_detector.process_image(content, file.filename)
-            result["filename"] = file.filename
-            result["file_type"] = "image"
         elif file.content_type.startswith('video/'):
             result = video_processor.process_video(content)
-            result["filename"] = file.filename
-            result["file_type"] = "video"
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type")
-        
-        # Save result
-        result_id = storage.save_result(file.filename, result)
-        result["result_id"] = result_id
         
         # Record performance
         processing_time = time.time() - start_time
@@ -301,6 +294,7 @@ async def process_file(file: UploadFile = File(...)):
             
     except Exception as e:
         performance_monitor.record_error()
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 @app.post("/add-noise")
@@ -461,5 +455,5 @@ if __name__ == "__main__":
         host="0.0.0.0", 
         port=8000,
         workers=1,  # Single worker to maximize GPU usage
-        loop="uvloop" if os.name != 'nt' else "asyncio"  # Use uvloop on Linux/Mac
+        loop="uvloop" if os.name != 'nt' else "asyncio" # Use uvloop on Linux/Mac
     )
