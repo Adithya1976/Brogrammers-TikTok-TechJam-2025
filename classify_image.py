@@ -1,4 +1,5 @@
-from transformers import AutoProcessor, AutoModelForObjectDetection
+from platform import processor
+from transformers import AutoProcessor, GroundingDinoForObjectDetection
 from PIL import Image
 import torch
 
@@ -17,9 +18,9 @@ def detect_with_grounding_dino(image_path, prompt: str = "", device: torch.devic
     image = Image.open(image_path).convert("RGB")
 
     # NOTE: replace this with a published Grounding DINO checkpoint on Hugging Face if needed
-    model_name = "ShilongLiu/groundingdino"  # <-- replace with valid HF grounding dino checkpoint id
+    model_name = "IDEA-Research/grounding-dino-tiny"
     processor = AutoProcessor.from_pretrained(model_name)
-    model = AutoModelForObjectDetection.from_pretrained(model_name).to(device)
+    model = GroundingDinoForObjectDetection.from_pretrained(model_name).to(device)
 
     # prepare inputs (include text prompt)
     inputs = processor(images=image, text=prompt, return_tensors="pt")
@@ -30,19 +31,46 @@ def detect_with_grounding_dino(image_path, prompt: str = "", device: torch.devic
 
     # post-process to get boxes in pixel coords (height, width expected)
     target_sizes = torch.tensor([image.size[::-1]]).to(device)  # image.size -> (width, height); target_sizes expects (height, width)
-    detections = processor.post_process_object_detection(outputs, target_sizes=target_sizes, threshold=score_threshold)[0]
+    detections = processor.post_process_grounded_object_detection(outputs, target_sizes=target_sizes, threshold=score_threshold)[0]
+
+    # Get readable labels robustly:
+    # - prefer "text_labels" (string names)
+    # - else try mapping integer ids via model.config.id2label
+    # - else fallback to str() of the value
+    raw_text_labels = detections.get("text_labels", None)
+    if raw_text_labels is not None:
+        labels = list(raw_text_labels)
+    else:
+        raw_labels = detections.get("labels", [])
+        labels = []
+        for rl in raw_labels:
+            try:
+                # rl might be a tensor/int id
+                labels.append(model.config.id2label[int(rl)])
+            except Exception:
+                labels.append(str(rl))
+
+    def safe_score_to_float(s):
+        try:
+            return float(s.detach().cpu().item())
+        except Exception:
+            try:
+                return float(s)
+            except Exception:
+                return None
 
     results = []
-    for score, label, box in zip(detections["scores"], detections["labels"], detections["boxes"]):
+    for score, label, box in zip(detections["scores"], labels, detections["boxes"]):
         results.append({
-            "score": float(score),
-            "label": model.config.id2label[int(label)],
+            "score": safe_score_to_float(score),
+            "label": label,
             "box": [float(x) for x in box],  # [xmin, ymin, xmax, ymax]
         })
 
     return results
 
 if __name__ == "__main__":
-    image_path = '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/photo_6159037021939680355_y.jpg'
-    detections = detect_with_grounding_dino(image_path, prompt="", device=None)
+    image_path = '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/hamid-roshaan-IGVGEFQHczg-unsplash.jpg'
+    prompt = "sign"
+    detections = detect_with_grounding_dino(image_path, prompt=prompt, device=None)
     print("Detections:", detections)
