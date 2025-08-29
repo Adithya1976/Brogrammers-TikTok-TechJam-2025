@@ -62,9 +62,9 @@ def get_keyframes(video_path: str, threshold: int = 5) -> List[int]:
 
 # Classical Method - GroundingDino + CSRT Tracking
 # Faster, lesser memory but blurs out entire bounding box
-def blur_region_in_image(image: Image.Image, box: tuple, method='pixelate', **kwargs) -> Image.Image:
+def blur_region_in_image(image: Image.Image, box: BoundingBox, method='pixelate', **kwargs) -> Image.Image:
     """A helper to blur a single rectangular region in an image."""
-    x1, y1, w, h = [int(v) for v in box]
+    x1, y1, w, h = [int(v) for v in box.xyxy]
     x2, y2 = x1 + w, y1 + h
     
     # Crop the region of interest
@@ -105,8 +105,8 @@ def process_video_with_csrt(video_path: str, output_path: str, labels: List[str]
     # --- FIX 1: Add a variable to store the last good state ---
     last_known_detections = []
 
-    # # Initialize model once for efficiency
-    # grounding_sam_pipeline = GroundingSAM(labels=labels)
+    # Initialize model once for efficiency
+    grounding_sam_pipeline = GroundingSAM()
 
     while True:
         success, frame = cap.read()
@@ -114,15 +114,14 @@ def process_video_with_csrt(video_path: str, output_path: str, labels: List[str]
             break
 
         current_pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        grounding_sam_pipeline = GroundingSAM(image=current_pil_image, labels=labels)
 
         if frame_number in keyframe_indices:
             print(f"\n--- Keyframe {frame_number}: Running Full Detection & Segmentation ---")
             trackers = [] # Reset trackers
-            detections = grounding_sam_pipeline.detect()
+            detections = grounding_sam_pipeline.detect(image=current_pil_image, labels=labels)
 
             if detections:
-                segmented_detections = grounding_sam_pipeline.segment()
+                segmented_detections = grounding_sam_pipeline.segment(image=current_pil_image, detections=detections)
                 processed_pil_image = blur_objects_in_image(current_pil_image, segmented_detections)
                 
                 # Update our last known state with these high-quality detections
@@ -154,7 +153,7 @@ def process_video_with_csrt(video_path: str, output_path: str, labels: List[str]
             # If we have successfully tracked objects, use them.
             if tracked_detections:
                 grounding_sam_pipeline.detections = tracked_detections
-                segmented_detections = grounding_sam_pipeline.segment()
+                segmented_detections = grounding_sam_pipeline.segment(image=current_pil_image, detections=tracked_detections)
                 processed_pil_image = blur_objects_in_image(current_pil_image, segmented_detections)
                 # Update our last known state with the new tracked positions
                 last_known_detections = segmented_detections
@@ -169,7 +168,7 @@ def process_video_with_csrt(video_path: str, output_path: str, labels: List[str]
                 processed_pil_image = current_pil_image
 
         # Write the final frame to the output video
-        output_frame_bgr = cv2.cvtColor(np.array(processed_pil_image), cv2.COLOR_RGB2BGR)
+        output_frame_bgr = cv2.cvtColor(np.array(processed_pil_image), cv2.COLOR_RGB2BGR) # type: ignore
         writer.write(output_frame_bgr)
 
         frame_number += 1

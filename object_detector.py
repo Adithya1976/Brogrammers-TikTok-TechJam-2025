@@ -38,97 +38,64 @@ class DetectionResult:
 class GroundingSAM:
     """
     A class for Grounding DINO with SAM (Segment Anything Model) integration.
+    Models are loaded once during initialization for efficient video processing.
     """
-    def __init__(self, image: Image.Image, labels: List[str], device: torch.device | None = None) -> None:
-        self.image = image
-        self.labels = labels # list of text labels for grounding dino
-
+    def __init__(self, device: torch.device | None = None) -> None:
         if device is None:
             self.device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
         else:
             self.device = device
-
-        self.detections = None
+        
+        print(f"Initializing GroundingSAM on device: {self.device}")
 
         # --- Use fast model names ---
         dino_model_name = "IDEA-Research/grounding-dino-tiny"
         sam_model_name = "facebook/sam-vit-base"
 
-        # --- Load models and processors ---
-        self.object_detector = pipeline(model=dino_model_name, task="zero-shot-object-detection", device=self.device, use_fast=True)
-
+        # --- Load models and processors once ---
+        self.object_detector = pipeline(model=dino_model_name, task="zero-shot-object-detection", device=self.device)
         self.sam_processor = AutoProcessor.from_pretrained(sam_model_name)
         self.sam_model = AutoModelForMaskGeneration.from_pretrained(sam_model_name).to(self.device)
 
-    def detect(self, score_threshold: float = 0.25) -> List[DetectionResult]:
+    def detect(self, image: Image.Image, labels: List[str], score_threshold: float = 0.25) -> List[DetectionResult]:
         """
-        Runs a Grounding DINO object-detection model on the image using the provided labels.
+        Runs Grounding DINO on the given image.
 
         Args:
+            image (Image.Image): The image to process.
+            labels (List[str]): The text labels for detection.
             score_threshold (float): The score threshold for filtering detections.
 
         Returns:
-            Updates and returns the `self.detections` attribute.
+            A list of DetectionResult objects.
         """
-        # model_name = "IDEA-Research/grounding-dino-tiny"
-        # object_detector = pipeline(model=model_name, task="zero-shot-object-detection", device=self.device, use_fast=True)
+        # Ensure labels end with a dot for better performance
+        processed_labels = [label if label.endswith(".") else label + "." for label in labels]
+        
+        results = self.object_detector(image, candidate_labels=processed_labels, threshold=score_threshold)
+        detections = [DetectionResult.from_dict(result) for result in results]
 
-        labels = [label if label.endswith(".") else label+"." for label in self.labels]
-
-        results = self.object_detector(self.image,  candidate_labels=labels, threshold=score_threshold)
-        results = [DetectionResult.from_dict(result) for result in results]
-
-        self.detections = results
+        # Store these detections for the segment method to use
+        self.detections = detections
         return self.detections
 
-    def __get_boxes(self) -> List[BoundingBox]:
+    def segment(self, image: Image.Image, detections: List[DetectionResult]) -> List[DetectionResult] | None:
         """
-        Returns the bounding boxes of the detected objects.
-        """
-        if self.detections is None:
-            return []
-        return [result.box for result in self.detections]
-
-    def __get_masks(self) -> List[np.ndarray]:
-        """
-        Returns the masks of the detected objects.
-        """
-        if self.detections is None:
-            return []
-        return [result.mask for result in self.detections if result.mask is not None]
-
-    def __get_labels(self) -> List[str]:
-        """
-        Returns the labels of the detected objects.
-        """
-        if self.detections is None:
-            return []
-        return [result.label for result in self.detections]
-
-    def __get_scores(self) -> List[float]:
-        """
-        Returns the scores of the detected objects.
-        """
-        if self.detections is None:
-            return []
-        return [result.score for result in self.detections]
-
-    def segment(self) -> List[DetectionResult] | None:
-        """
-        Segments the detected objects in the image using SAM.
+        Segments the detected objects (from the last `detect` call) in the image using SAM.
+        
+        Args:
+            image (Image.Image): The image that was used for the last detection.
 
         Returns:
-            Updates the masks for each object in `self.detections` and returns the updated detections.
+            The detection list with masks updated.
         """
-        # model_name = "facebook/sam-vit-base"
-        # segmentator = AutoModelForMaskGeneration.from_pretrained(model_name).to(self.device)
-        # processor = AutoProcessor.from_pretrained(model_name, use_fast=True)
+        if not detections:
+            print("Warning: segment() called without any prior detections.")
+            return None
+        
+        input_boxes = [[box.xyxy for box in self.__get_boxes(detections)]]
+        feats = self.sam_processor(images=image, input_boxes=input_boxes, return_tensors="pt")
 
-        # Prepare inputs for SAM
-        # SAM's processor can take a list of bounding box lists. We have one image, so it's a list containing one list of boxes.
-        input_boxes = [[box.xyxy for box in self.__get_boxes()]]
-        feats = self.sam_processor(images=self.image, input_boxes=input_boxes, return_tensors="pt")
-        # keep original/reshaped sizes for post-processing
         original_sizes = feats.original_sizes
         reshaped_input_sizes = feats.reshaped_input_sizes
 
@@ -141,65 +108,80 @@ class GroundingSAM:
         # Get the segmentation masks
         with torch.no_grad():
             outputs = self.sam_model(**inputs)
-        
-        # Post-process to get masks in the original image size.
         masks_tensor = self.sam_processor.post_process_masks(
             masks=outputs.pred_masks,
             original_sizes=original_sizes,
             reshaped_input_sizes=reshaped_input_sizes
         )[0]
-
-        # Normalize masks_tensor to shape (num_masks, H, W)
-        # Common outputs: (num, 1, H, W) or (num, H, W). Remove singleton channel at axis=1 if present.
+        
         if masks_tensor.ndim == 4 and masks_tensor.shape[1] == 1:
-            masks_tensor = masks_tensor.squeeze(1)  # -> (num, H, W)
+            masks_tensor = masks_tensor.squeeze(1)
         else:
-            masks_tensor = masks_tensor.squeeze()  # remove any extra singleton dims
-        # now masks_tensor should be (num_masks, H, W)
+            masks_tensor = masks_tensor.squeeze()
 
-        # Check if the number of masks matches the number of detections
-        if not self.detections:
-            return self.detections
+        for i, detection in enumerate(detections):
+            # Get the i-th mask and ensure it's a 2D numpy binary mask (H, W)
+            mask_tensor = masks_tensor[i].cpu().squeeze()
+            mask_np = mask_tensor.numpy()
+            # If the mask has an unexpected channel dimension, collapse it to (H, W)
+            if mask_np.ndim == 3:
+                h, w = image.height, image.width
+                if mask_np.shape == (h, w, mask_np.shape[2]):
+                    mask_np = mask_np.max(axis=-1)
+                elif mask_np.shape == (mask_np.shape[0], h, w):
+                    mask_np = mask_np.max(axis=0)
+                else:
+                    # fallback: reduce the first axis
+                    mask_np = mask_np.max(axis=0)
+            # store as binary 0/1 uint8 (other code expects this)
+            detection.mask = (mask_np > 0).astype(np.uint8)
 
-        # if len(masks_tensor) != len(self.detections):
-        #     print(f"Warning: Mismatch between number of detections ({len(self.detections)}) and masks ({len(masks_tensor)}).")
-        #     return self.detections
+        return detections
 
-        # Attach each mask to its corresponding detection object
-        for i, detection in enumerate(self.detections):
-            # Ensure mask_tensor is 2D (H, W)
-            mask_tensor = masks_tensor[i].cpu().squeeze() # type: ignore
-            # If a channel dimension remains (e.g., (H, W, C) or (C, H, W)), collapse it.
-            if mask_tensor.ndim == 3:
-                # if channels-first (C, H, W) -> collapse channels by max
-                # if channels-last (H, W, C) converting to numpy below will still work but we collapse anyway
-                try:
-                    # channels-first: collapse dim 0
-                    mask_tensor = mask_tensor.max(dim=0)[0]
-                except Exception:
-                    # fallback: convert to numpy then collapse last axis
-                    m = mask_tensor.numpy()
-                    mask_tensor = torch.from_numpy(m.max(axis=-1))
+    def __get_boxes(self, detections: List[DetectionResult]) -> List[BoundingBox]:
+        """
+        Returns the bounding boxes of the detected objects.
+        """
+        if detections is None:
+            return []
+        return [result.box for result in detections]
 
-            # Binarize and convert to uint8 0/255
-            mask_np = (mask_tensor.numpy() > 0).astype(np.uint8) * 255
+    def __get_masks(self, detections: List[DetectionResult]) -> List[np.ndarray]:
+        """
+        Returns the masks of the detected objects.
+        """
+        if detections is None:
+            return []
+        return [result.mask for result in detections if result.mask is not None]
 
-            detection.mask = mask_np
+    def __get_labels(self, detections: List[DetectionResult]) -> List[str]:
+        """
+        Returns the labels of the detected objects.
+        """
+        if detections is None:
+            return []
+        return [result.label for result in detections]
 
-        return self.detections
+    def __get_scores(self, detections: List[DetectionResult]) -> List[float]:
+        """
+        Returns the scores of the detected objects.
+        """
+        if detections is None:
+            return []
+        return [result.score for result in detections]
 
-    def draw_on_image(self) -> Image.Image:
+    def draw_on_image(self, image: Image.Image, detections: List[DetectionResult]) -> Image.Image:
         """
         Draws the bounding boxes and masks on the image.
         """
-        if self.detections is None:
-            return self.image
+        if not detections:
+            return image
 
-        image = self.image.copy() # Work on a copy of the image
+        image = image.copy() # Work on a copy of the image
 
         draw = ImageDraw.Draw(image)
 
-        for detection in self.detections:
+        for detection in detections:
             # Draw bounding box
             draw.rectangle(detection.box.xyxy, outline="red", width=2)
 
@@ -210,8 +192,7 @@ class GroundingSAM:
 
         return image
 
-    # TODO: Check if this is needed
-    def blur_objects_in_image(self, radius: int = 25) -> Image.Image:
+    def blur_objects_in_image(self, image: Image.Image, detections: List[DetectionResult], radius: int = 25) -> Image.Image:
         """
         Blurs the objects in the image based on the detected masks.
 
@@ -227,10 +208,10 @@ class GroundingSAM:
         # 2. Create a combined mask for all detected objects
         combined_mask_np = np.zeros(np.array(image).shape[:2], dtype=np.uint8)
 
-        if not self.detections:
-            return self.image
+        if not detections:
+            return image
 
-        for detection in self.detections:
+        for detection in detections:
             if detection.mask is None:
                 continue
 
@@ -238,7 +219,7 @@ class GroundingSAM:
             combined_mask_np = np.maximum(combined_mask_np, detection.mask)
 
         # 3. Convert the combined NumPy mask back to a PIL Image
-        combined_mask_pil = Image.fromarray(combined_mask_np, mode='L')
+        combined_mask_pil = Image.fromarray((combined_mask_np * 255).astype(np.uint8), mode='L')
 
         # 4. Composite the blurred image onto the original using the combined mask
         final_image = Image.composite(blurred_image, image, combined_mask_pil)
@@ -246,6 +227,7 @@ class GroundingSAM:
         return final_image
 
 
+# TODO: Check if this is needed
 def blur_objects_in_image(image: Image.Image, detections: List[DetectionResult] | None, radius: int = 25) -> Image.Image:
     """
     Blurs the objects in the image based on the detected masks.
@@ -268,17 +250,27 @@ def blur_objects_in_image(image: Image.Image, detections: List[DetectionResult] 
     for detection in detections:
         if detection.mask is None:
             continue
+        mask = np.asarray(detection.mask)
+        # Collapse accidental channel dimension if present
+        if mask.ndim == 3:
+            h, w = image.height, image.width
+            if mask.shape == (h, w, mask.shape[2]):
+                mask = mask.max(axis=-1)
+            elif mask.shape == (mask.shape[0], h, w):
+                mask = mask.max(axis=0)
+            else:
+                mask = mask.max(axis=0)
+        mask = (mask > 0).astype(np.uint8)
+        combined_mask_np = np.maximum(combined_mask_np, mask)
 
-        # Combine the current object's mask with the master mask.
-        combined_mask_np = np.maximum(combined_mask_np, detection.mask)
-
-    # 3. Convert the combined NumPy mask back to a PIL Image
-    combined_mask_pil = Image.fromarray(combined_mask_np, mode='L')
+    # 3. Convert the combined NumPy mask back to a PIL Image (scale to 0-255)
+    combined_mask_pil = Image.fromarray((combined_mask_np * 255).astype(np.uint8), mode='L')
 
     # 4. Composite the blurred image onto the original using the combined mask
     final_image = Image.composite(blurred_image, image, combined_mask_pil)
 
     return final_image
+
 
 # Example Workflow
 if __name__ == "__main__":
@@ -290,11 +282,11 @@ if __name__ == "__main__":
     image = Image.open(image_path).convert("RGB")
     image = ImageOps.exif_transpose(image)  # handle exif orientation
 
-    groundingSAM = GroundingSAM(image=image, labels=input_labels)
+    groundingSAM = GroundingSAM()
 
     # 1. Detect objects with GroundingDINO
     print("Step 1: Detecting objects...")
-    detections = groundingSAM.detect(score_threshold=0.3)
+    detections = groundingSAM.detect(image=image, labels=input_labels, score_threshold=0.3)
 
     if not detections:
         print("No objects detected. Exiting.")
@@ -303,13 +295,13 @@ if __name__ == "__main__":
             print(detection)
 
         # Draw original bounding boxes for comparison
-        bbox_image = groundingSAM.draw_on_image()
+        bbox_image = groundingSAM.draw_on_image(image, detections)
         print("Showing image with original bounding boxes...")
         bbox_image.show()
 
         # 2. Segment the detected objects with SAM
         print("\nStep 2: Segmenting detected objects...")
-        segmented_detections = groundingSAM.segment()
+        segmented_detections = groundingSAM.segment(image=image, detections=detections)
 
         # 3. Apply the blur effect using the generated masks
         print("\nStep 3: Applying blur effect...")
