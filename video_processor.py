@@ -4,7 +4,7 @@ import imagehash
 import numpy as np
 import logging
 from PIL import Image
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from object_detector import GroundingSAM, DetectionResult, BoundingBox
 
 
@@ -286,30 +286,28 @@ def create_debug_video(
     writer.release()
     cv2.destroyAllWindows()
 
-
 class VideoProcessor:
     """
-    Processes a video to detect, track, and generate masks for individual entities.
+    Processes a video to detect, track, and generate masks for both
+    visual (GroundingSAM) and text-based (OCR) entities.
     """
     def __init__(self, labels: List[str]):
-        self.labels = labels
+        ## INTEGRATION: Rename `labels` to `visual_labels` for clarity
+        self.visual_labels = labels
         self.grounding_sam = GroundingSAM()
+        ## INTEGRATION: Instantiate the OCR processor
+        self.ocr_processor = OCRProcessor() # type: ignore
         self.video_info = {}
 
     def process_video(self, video_path: str, keyframe_threshold: int = 7, iou_threshold: float = 0.5) -> Dict[str, Any]:
         cap = cv2.VideoCapture(video_path)
-
-        # Get video properties
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.video_info = {"width": width, "height": height, "fps": fps, "frame_count": frame_count}
-
-        # Get keyframes
         keyframe_indices = get_keyframes(video_path, threshold=keyframe_threshold)
 
-        # --- Core data structures for tracking individual entities ---
         tracked_entities: Dict[int, Dict[str, Any]] = {}
         next_entity_id = 0
         
@@ -322,118 +320,136 @@ class VideoProcessor:
             current_pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
             if frame_number in keyframe_indices:
-                logging.info(f"--- Keyframe {frame_number}: Re-identifying entities ---")
-                detections = self.grounding_sam.detect(image=current_pil_image, labels=self.labels)
-                segmented_detections = self.grounding_sam.segment(current_pil_image, detections) if detections else []
+                logging.info(f"--- Keyframe {frame_number}: Detecting and Re-identifying entities ---")
 
-                if not segmented_detections:
-                    # No detections on this keyframe, deactivate all trackers
-                    for entity in tracked_entities.values():
-                        entity['active'] = False
+                ## INTEGRATION: Get detections from both pipelines
+                visual_detections = self.grounding_sam.detect(image=current_pil_image, labels=self.visual_labels)
+                text_detections_dicts = self.ocr_processor.detect(image=current_pil_image)
+
+                ## INTEGRATION: Unify detections into a single list with standardized format and masks
+                all_processed_detections: List[DetectionResult] = []
+
+                # Process and segment visual detections
+                if visual_detections:
+                    segmented_visuals = self.grounding_sam.segment(current_pil_image, visual_detections)
+                    if segmented_visuals:
+                        for det in segmented_visuals:
+                            setattr(det, 'type', 'visual') # Tag entity type
+                            all_processed_detections.append(det)
+                
+                # Process and create box masks for text detections
+                for det_dict in text_detections_dicts:
+                    box = det_dict['box']
+                    text_dr = DetectionResult(
+                        score=det_dict.get('score', 0.95),
+                        label=det_dict['label'],
+                        box=box,
+                        mask=self._create_box_mask(box, height, width) # Generate box mask
+                    )
+                    setattr(text_dr, 'type', 'text') # Tag entity type
+                    all_processed_detections.append(text_dr)
+
+                # --- Re-Identification Logic (now works on the unified list) ---
+                if not all_processed_detections:
+                    for entity in tracked_entities.values(): entity['active'] = False
                 else:
-                    # --- The Re-Identification Logic ---
                     active_entity_ids = [eid for eid, e in tracked_entities.items() if e['active']]
                     matched_detection_indices = set()
 
-                    # Try to match existing entities with new detections
                     for entity_id in active_entity_ids:
                         entity = tracked_entities[entity_id]
-                        best_match_iou = -1
-                        best_match_idx = -1
-
-                        for i, det in enumerate(segmented_detections):
+                        best_match_iou, best_match_idx = -1, -1
+                        for i, det in enumerate(all_processed_detections):
                             iou = calculate_iou(entity['box'], det.box)
                             if iou > iou_threshold and iou > best_match_iou:
-                                best_match_iou = iou
-                                best_match_idx = i
+                                best_match_iou, best_match_idx = iou, i
                         
                         if best_match_idx != -1:
-                            logging.info(f"Re-identified entity {entity_id} with IoU: {best_match_iou:.2f}")
-                            detection = segmented_detections[best_match_idx]
-                            
-                            # Update the entity with the new, more accurate data
+                            detection = all_processed_detections[best_match_idx]
+                            # Update entity tracker and data
                             tracker = cv2.TrackerCSRT_create() # type: ignore
                             tracker_box = (int(detection.box.xmin), int(detection.box.ymin), int(detection.box.xmax - detection.box.xmin), int(detection.box.ymax - detection.box.ymin))
                             tracker.init(frame, tracker_box)
-                            
-                            entity['tracker'] = tracker
-                            entity['box'] = detection.box
+                            entity.update({'tracker': tracker, 'box': detection.box})
                             entity['masks'].append((frame_number, detection.mask))
                             matched_detection_indices.add(best_match_idx)
                         else:
-                            # This entity was not found in the new detections, deactivate it
                             entity['active'] = False
-                            logging.info(f"Entity {entity_id} lost.")
                     
-                    # Add new, unmatched detections as new entities
-                    for i, det in enumerate(segmented_detections):
+                    for i, det in enumerate(all_processed_detections):
                         if i not in matched_detection_indices:
+                            # This is a new entity
                             tracker = cv2.TrackerCSRT_create() # type: ignore
                             tracker_box = (int(det.box.xmin), int(det.box.ymin), int(det.box.xmax - det.box.xmin), int(det.box.ymax - det.box.ymin))
                             tracker.init(frame, tracker_box)
                             
+                            ## INTEGRATION: Store the entity type
                             tracked_entities[next_entity_id] = {
                                 'label': det.label,
+                                'type': getattr(det, 'type'), # Get the type we tagged earlier
                                 'tracker': tracker,
                                 'box': det.box,
                                 'masks': [(frame_number, det.mask)],
                                 'active': True
                             }
-                            logging.info(f"New entity {next_entity_id} ({det.label}) detected.")
+                            logging.info(f"New entity {next_entity_id} ({det.label}, type: {getattr(det, 'type')}) detected.")
                             next_entity_id += 1
             else:
-                # --- Intermediate Frame: Update active trackers ---
+                # --- Intermediate Frame: Update trackers and generate masks ---
                 active_entities = [e for e in tracked_entities.values() if e['active']]
                 if active_entities:
-                    # Prepare boxes for batch segmentation
-                    boxes_to_segment = []
-                    entity_map = [] # To map segment results back to entities
-                    
+                    boxes_to_process, entity_map = [], []
                     for entity in active_entities:
                         success, box = entity['tracker'].update(frame)
                         if success:
                             x1, y1, w, h = [int(v) for v in box]
-                            tracked_box = BoundingBox(xmin=x1, ymin=y1, xmax=x1 + w, ymax=y1 + h)
-                            entity['box'] = tracked_box # Update box position
-                            boxes_to_segment.append(DetectionResult(score=0.99, label=entity['label'], box=tracked_box))
+                            entity['box'] = BoundingBox(xmin=x1, ymin=y1, xmax=x1 + w, ymax=y1 + h)
+                            boxes_to_process.append(DetectionResult(score=0.99, label=entity['label'], box=entity['box']))
                             entity_map.append(entity)
                         else:
-                            entity['active'] = False # Tracker failed
+                            entity['active'] = False
 
-                    # Run segmentation on all successfully tracked boxes at once
-                    if boxes_to_segment:
-                        segmented_tracked_boxes = self.grounding_sam.segment(current_pil_image, boxes_to_segment)
-                        if segmented_tracked_boxes:
-                            for i, det in enumerate(segmented_tracked_boxes):
-                                entity_map[i]['masks'].append((frame_number, det.mask))
+                    ## INTEGRATION: Split processing based on entity type
+                    visual_entities_to_segment = []
+                    visual_entity_map = []
+
+                    for i, det_result in enumerate(boxes_to_process):
+                        entity = entity_map[i]
+                        if entity['type'] == 'visual':
+                            visual_entities_to_segment.append(det_result)
+                            visual_entity_map.append(entity)
+                        elif entity['type'] == 'text':
+                            # For text, just generate the box mask directly
+                            box_mask = self._create_box_mask(det_result.box, height, width)
+                            entity['masks'].append((frame_number, box_mask))
+                    
+                    # Run batch segmentation ONLY on visual entities
+                    if visual_entities_to_segment:
+                        segmented_results = self.grounding_sam.segment(current_pil_image, visual_entities_to_segment)
+                        if segmented_results:
+                            for i, seg_det in enumerate(segmented_results):
+                                visual_entity_map[i]['masks'].append((frame_number, seg_det.mask))
             
-            if frame_number % fps == 0:
-                logging.info(f"Processed {frame_number}/{frame_count} frames...")
+            if frame_number % fps == 0: logging.info(f"Processed {frame_number}/{frame_count} frames...")
             frame_number += 1
             
         cap.release()
         return self._finalize_output(tracked_entities)
 
     def _finalize_output(self, tracked_entities: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
-        """Formats the tracked entity data into the desired final structure."""
         output_entities = []
         for entity_id, entity_data in tracked_entities.items():
-            if not entity_data['masks']:
-                continue
-
-            # Extract frame numbers and masks
+            if not entity_data['masks']: continue
             frame_nums, masks = zip(*entity_data['masks'])
-            
-            # Stack masks into a (T, H, W) numpy array
             mask_video = np.stack(masks, axis=0)
 
+            ## INTEGRATION: Add entity type to the final output
             output_entities.append({
                 "entity_id": entity_id,
                 "label": entity_data['label'],
+                "type": entity_data['type'],
                 "start_frame": min(frame_nums),
                 "end_frame": max(frame_nums),
-                # The mask_video contains masks ONLY for the frames where the entity was present.
-                # The shape is (number_of_frames_present, height, width)
                 "mask_video": mask_video
             })
         
@@ -441,6 +457,22 @@ class VideoProcessor:
             "shape": (self.video_info['width'], self.video_info['height'], self.video_info['frame_count']),
             "entities": output_entities
         }
+
+    def _ocr_to_bounding_box(self, ocr_box: List[Tuple[int, int]]) -> BoundingBox:
+        """Converts an OCR box object to a BoundingBox object. The OCR box object
+        is a list of 4 coordinates ([x1, y1), (x2, y2), (x3, y3), (x4, y4)]."""
+        return BoundingBox(
+            xmin=min(box[0] for box in ocr_box),
+            ymin=min(box[1] for box in ocr_box),
+            xmax=max(box[0] for box in ocr_box),
+            ymax=max(box[1] for box in ocr_box)
+        )
+
+    def _create_box_mask(self, box: BoundingBox, height: int, width: int) -> np.ndarray:
+        mask = np.zeros((height, width), dtype=np.uint8)
+        xmin, ymin, xmax, ymax = [int(v) for v in box.xyxy]
+        mask[ymin:ymax, xmin:xmax] = 1
+        return mask
 
 
 if __name__ == '__main__':

@@ -33,6 +33,7 @@ class DetectionResult:
     label: str
     box: BoundingBox
     mask: Optional[np.ndarray] = None
+    type: str = "visual"  # 'visual' or 'text'
 
     @classmethod
     def from_dict(cls, detection_dict: Dict) -> 'DetectionResult':
