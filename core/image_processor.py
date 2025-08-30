@@ -7,6 +7,7 @@ import numpy as np
 import cv2
 import base64
 from core.adversarial_noise import AdversarialNoiseGenerator
+import logging
 
 
 class ImageProcessor:
@@ -25,9 +26,25 @@ class ImageProcessor:
             raise RuntimeError("PNG encode failed")
         return base64.b64encode(buf).decode("ascii")
 
-    def process_image(self, image_bytes: bytes) -> dict:
+    def process_image(self, image_bytes: bytes, max_dimension: int = 720) -> dict:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        shape = image.size
+        (original_width, original_height) = image.size
+
+        # --- Calculate processing dimensions ---
+        if original_width > original_height:
+            # Landscape or square
+            processing_width = max_dimension
+            processing_height = int(original_height * (max_dimension / original_width))
+        else:
+            # Portrait
+            processing_height = max_dimension
+            processing_width = int(original_width * (max_dimension / original_height))
+        
+        logging.info(f"Original resolution: {original_width}x{original_height}")
+        logging.info(f"Processing at downscaled resolution: {processing_width}x{processing_height}")
+
+        # --- DOWNSAMPLE FRAME ---
+        image = image.resize((processing_width, processing_height))
 
         # step 1: Object Detection
         object_detection_results = self.object_detector.process_image(image)
@@ -53,6 +70,9 @@ class ImageProcessor:
             "mask": self.to_png_b64(e["mask"], is_mask=True),
         } for e in entities]
 
+        # --- DOWNSAMPLE FRAME ---
+        image = image.resize((original_width, original_height))
+
         # step 3: adversarial networks
         # placeholder
         # noise_induced_image = image
@@ -65,7 +85,7 @@ class ImageProcessor:
 
         result = {
             "processed_image": self.to_png_b64(np.array(noise_induced_image)),
-            "shape": shape,
+            "shape": (original_width, original_height),
             "entities": entities
         }
         
