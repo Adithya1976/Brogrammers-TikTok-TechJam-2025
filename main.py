@@ -32,14 +32,6 @@ app = FastAPI(
     description="GPU-accelerated privacy detection for mobile apps"
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],   # tighten for prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # -------------------------
 # Globals
 # -------------------------
@@ -304,7 +296,7 @@ async def health_check():
 if __name__ == "__main__":
     uvicorn.run(
         app,
-        host="localhost", # Prefer localhost over 0.0.0.0
+        host="0.0.0.0", # Prefer localhost over 0.0.0.0
         port=8000,
         workers=1,  # single worker keeps GPU libs simple; scale with a real queue later
     )
