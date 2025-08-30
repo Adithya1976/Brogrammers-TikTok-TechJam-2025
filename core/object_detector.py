@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pprint import pprint
-from transformers import AutoProcessor, AutoModelForMaskGeneration, pipeline
+import re
+from transformers import AutoProcessor, AutoModelForMaskGeneration, pipeline, AutoModelForZeroShotObjectDetection
 from PIL import Image, ImageDraw, ImageOps, ImageFilter
 import torch
 from typing import List, Optional, Dict, Any
@@ -45,56 +46,47 @@ class DetectionResult:
                                    ymax=float(detection_dict['box']['ymax'])))
 
 
+def batch_generator(data: List[Any], batch_size: int):
+    """Yields successive n-sized chunks from a list."""
+    for i in range(0, len(data), batch_size):
+        yield data[i:i + batch_size]
+
+
 class GroundingDINO_SAMModel:
     """
     A class for Grounding DINO with SAM (Segment Anything Model) integration.
     Models are loaded once during initialization for efficient video processing.
     """
-    def __init__(self, device: torch.device | None = None) -> None:
+    def __init__(self, device: torch.device | None = None):
         if device is None:
             self.device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
         else:
             self.device = device
+        logging.info(f"Initializing models on device: {self.device}")
 
-        logging.info(f"Initializing GroundingSAM on device: {self.device}")
-
-        # --- Use fast model names ---
         dino_model_name = "IDEA-Research/grounding-dino-tiny"
         sam_model_name = "facebook/sam-vit-base"
 
-        # --- Load models and processors once ---
-        self.object_detector = pipeline(model=dino_model_name, task="zero-shot-object-detection", device=self.device)
+        # --- MODIFICATION: Load DINO processor and model directly, instead of using pipeline ---
+        self.dino_processor = AutoProcessor.from_pretrained(dino_model_name)
+        self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_model_name).to(self.device)
+        
+        # --- SAM model loading remains the same ---
         self.sam_processor = AutoProcessor.from_pretrained(sam_model_name)
         self.sam_model = AutoModelForMaskGeneration.from_pretrained(sam_model_name).to(self.device)
 
         # Set default labels for detection (if none are provided)
         self.default_labels = ["person", "license plate", "card", "sign"]
 
-    def detect(self, image: Image.Image, labels: List[str] = [], score_threshold: float = 0.4) -> List[DetectionResult]:
+    def detect(self, image: Image.Image, labels: List[str], score_threshold: float = 0.25) -> List[DetectionResult]:
         """
-        Runs Grounding DINO on the given image.
-
-        Args:
-            image (Image.Image): The image to process.
-            labels (List[str]): The text labels for detection.
-            score_threshold (float): The score threshold for filtering detections.
-
-        Returns:
-            A list of DetectionResult objects.
+        Runs Grounding DINO on a single image. This is now a convenience wrapper
+        around the more powerful detect_batch method.
         """
-        if not labels:
-            labels = self.default_labels
-
-        # Ensure labels end with a dot for better performance
-        processed_labels = [label if label.endswith(".") else label + "." for label in labels]
-        
-        results = self.object_detector(image, candidate_labels=processed_labels, threshold=score_threshold)
-        detections = [DetectionResult.from_dict(result) for result in results]
-
-        # Store these detections for the segment method to use
-        self.detections = detections
-        return self.detections
-
+        # Simply call the batch method with a single image and return the first result
+        batch_results = self.detect_batch([image], labels, score_threshold)
+        return batch_results[0] if batch_results else []
+    
     def segment(self, image: Image.Image, detections: List[DetectionResult]) -> List[DetectionResult] | None:
         """
         Segments the detected objects (from the last `detect` call) in the image using SAM.
@@ -265,91 +257,163 @@ class GroundingDINO_SAMModel:
             "entities": output_entities
         }
 
+    def detect_batch(self, images: List[Image.Image], labels: List[str], score_threshold: float = 0.25, batch_size: int = 4) -> List[List[DetectionResult]]:
+        """
+        Runs Grounding DINO on a list of images in controlled batches to manage GPU memory.
+        """
+        if not images:
+            return []
+        
+        logging.info(f"Running batch detection on {len(images)} images with batch_size={batch_size}...")
+
+        # --- THE FIX IS HERE ---
+        # 1. Join the labels into a single string. A dot separator is standard for Grounding DINO.
+        text_prompt = " . ".join(labels)
+        # Ensure the final prompt also ends with a dot if it doesn't already.
+        if not text_prompt.endswith("."):
+            text_prompt += "."
+        # --- END OF FIX ---
+        
+        all_detections = []
+        for image_mini_batch in batch_generator(images, batch_size):
+            # 2. Create a list where this single prompt string is duplicated for each image in the batch.
+            texts = [text_prompt] * len(image_mini_batch)
+            # This results in the correct format: List[str], e.g., ['person. . car.', 'person. . car.']
+
+            # Prepare inputs for the mini-batch
+            inputs = self.dino_processor(images=image_mini_batch, text=texts, return_tensors="pt").to(self.device)
+            
+            # Run model inference on the mini-batch
+            with torch.no_grad():
+                outputs = self.dino_model(**inputs)
+                
+            # Post-process the raw outputs for the mini-batch
+            target_sizes = torch.tensor([img.size[::-1] for img in image_mini_batch])
+            results = self.dino_processor.post_process_grounded_object_detection(outputs, threshold=score_threshold, target_sizes=target_sizes)
+
+            # Convert and append results from this mini-batch to our master list
+            for result in results:
+                boxes, scores, result_labels = result["boxes"], result["scores"], result["labels"]
+                image_detections = [
+                    DetectionResult(
+                        score=float(score), label=label,
+                        box=BoundingBox(xmin=float(b[0]), ymin=float(b[1]), xmax=float(b[2]), ymax=float(b[3]))
+                    ) for b, score, label in zip(boxes, scores, result_labels)
+                ]
+                all_detections.append(image_detections)
+
+        return all_detections
+
+    # --- MODIFIED BATCH SEGMENTATION METHOD ---
+    def segment_batch(self, images: List[Image.Image], detections_batch: List[List[DetectionResult]], batch_size: int = 4) -> List[List[DetectionResult | None]]:
+        """
+        Runs SAM on a list of images and their corresponding detections.
+        This implementation uses a reliable sequential loop over the single-image
+        segment method to handle the case where images have a variable number of detections.
+        The batch_size parameter is ignored here for reliability.
+        """
+        if len(images) != len(detections_batch):
+            raise ValueError("The number of images must match the number of detection lists for batch segmentation.")
+
+        logging.warning("Using reliable sequential loop for batch segmentation due to processor API limitations.")
+
+        all_segmented_results = []
+        # Loop through each image and its detections individually.
+        # This is the most robust way to handle this, as the single-image `segment` method is reliable.
+        for i, image in enumerate(images):
+            detections_for_image = detections_batch[i]
+            
+            # If there are no detections, there's nothing to segment.
+            if not detections_for_image:
+                all_segmented_results.append(detections_for_image) # Append the empty list
+                continue
+
+            # Run the robust single-image segment method.
+            segmented_results = self.segment(image, detections_for_image)
+            all_segmented_results.append(segmented_results)
+
+        return all_segmented_results
+
+
+
+
+
+
 
 # Example Workflow
 if __name__ == "__main__":
     # Ensure your dataclasses and detect/draw_on_image functions are defined
     
-    image_path = '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/number plates/mercedes_number_plate.png'
+    image_paths = ['/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/number plates/mercedes_number_plate.png',
+                   '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/signboards/christophe-leemans-odmMdVmicgY-unsplash.jpg',
+                   '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/signboards/govind-krishnan-uZPwtq5E2go-unsplash.jpg',
+                   '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/signboards/kait-herzog-6vWD_xnzPuU-unsplash.jpg',
+                   '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/signboards/hamid-roshaan-IGVGEFQHczg-unsplash.jpg',
+                   '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/people/windows-p74ndnYWRY4-unsplash.jpg'
+                   ]
 
-    try:
-        image = Image.open(image_path).convert("RGB")
-        image = ImageOps.exif_transpose(image)
-    except FileNotFoundError:
-        logging.error(f"Error: Image file not found at {image_path}. Please update the path.")
-        exit()
+    # try:
+    #     image = Image.open(image_path).convert("RGB")
+    #     image = ImageOps.exif_transpose(image)
+    # except FileNotFoundError:
+    #     logging.error(f"Error: Image file not found at {image_path}. Please update the path.")
+    #     exit()
 
-    # --- Define labels to search for ---
-    input_labels = ["person", "license plate", "chair"]
+    # # --- Define labels to search for ---
+    # input_labels = ["person", "license plate", "chair"]
 
-    # --- Initialize the pipeline ONCE ---
-    print("Initializing GroundingDINO_SAMModel pipeline...")
-    g_sam = GroundingDINO_SAMModel()
+    # # --- Initialize the pipeline ONCE ---
+    # print("Initializing GroundingDINO_SAMModel pipeline...")
+    # g_sam = GroundingDINO_SAMModel()
 
-    # --- Process the image ---
-    print(f"\nProcessing image for labels: {input_labels}")
-    processed_data = g_sam.process_image(image=image, labels=input_labels)
+    # # --- Process the image ---
+    # print(f"\nProcessing image for labels: {input_labels}")
+    # processed_data = g_sam.process_image(image=image, labels=input_labels)
 
-    # --- Print the structured output ---
-    print("\n--- Structured Output ---")
-    # Using pprint for readable dictionary printing
-    pprint(processed_data)
+    # # --- Print the structured output ---
+    # print("\n--- Structured Output ---")
+    # # Using pprint for readable dictionary printing
+    # pprint(processed_data)
 
-    # --- (Optional) Visualize the aggregated masks ---
-    if processed_data['entities']:
-        print("\nVisualizing aggregated masks...")
-        # Create a copy of the image to draw on
-        visual_image = image.copy()
+    # # --- (Optional) Visualize the aggregated masks ---
+    # if processed_data['entities']:
+    #     print("\nVisualizing aggregated masks...")
+    #     # Create a copy of the image to draw on
+    #     visual_image = image.copy()
         
-        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)] # Red, Green, Blue, Yellow
+    #     colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)] # Red, Green, Blue, Yellow
 
-        for i, entity in enumerate(processed_data['entities']):
-            mask_np = entity['mask']
-            color = colors[i % len(colors)]
+    #     for i, entity in enumerate(processed_data['entities']):
+    #         mask_np = entity['mask']
+    #         color = colors[i % len(colors)]
             
-            # Create a colored mask image: shape (H, W, 3)
-            colored_mask = np.zeros((*mask_np.shape, 3), dtype=np.uint8)
-            colored_mask[mask_np == 1] = color
+    #         # Create a colored mask image: shape (H, W, 3)
+    #         colored_mask = np.zeros((*mask_np.shape, 3), dtype=np.uint8)
+    #         colored_mask[mask_np == 1] = color
             
-            # Convert to PIL Image for blending
-            mask_image = Image.fromarray(colored_mask, 'RGB')
+    #         # Convert to PIL Image for blending
+    #         mask_image = Image.fromarray(colored_mask, 'RGB')
             
-            # Blend the mask with the original image
-            visual_image = Image.blend(visual_image, mask_image, alpha=0.1)
+    #         # Blend the mask with the original image
+    #         visual_image = Image.blend(visual_image, mask_image, alpha=0.1)
 
-        visual_image.show(title="Aggregated Masks Visualization")
+    #     visual_image.show(title="Aggregated Masks Visualization")
 
-    ## Another Example
+    # Another Example
 
-    # input_labels = ["person", "license plate", "sign"]
+    input_labels = ["person", "license plate", "sign"]
 
-    # image = Image.open(image_path).convert("RGB")
-    # image = ImageOps.exif_transpose(image)  # handle exif orientation
+    images = []
+    for image_path in image_paths:
+        image = Image.open(image_path).convert("RGB")
+        image = ImageOps.exif_transpose(image)  # handle exif orientation
+        images.append(image)
 
-    # groundingSAM = GroundingSAM()
+    groundingSAM = GroundingDINO_SAMModel()
 
-    # # 1. Detect objects with GroundingDINO
-    # print("Step 1: Detecting objects...")
-    # detections = groundingSAM.detect(image=image, labels=input_labels, score_threshold=0.3)
+    # 1. Detect objects with GroundingDINO
+    print("Step 1: Detecting objects...")
+    detections = groundingSAM.detect_batch(images=images, labels=input_labels, score_threshold=0.3)
 
-    # if not detections:
-    #     print("No objects detected. Exiting.")
-    # else:
-    #     for detection in detections:
-    #         print(detection)
-
-    #     # Draw original bounding boxes for comparison
-    #     bbox_image = groundingSAM.draw_on_image(image, detections)
-    #     print("Showing image with original bounding boxes...")
-    #     bbox_image.show()
-
-    #     # 2. Segment the detected objects with SAM
-    #     print("\nStep 2: Segmenting detected objects...")
-    #     segmented_detections = groundingSAM.segment(image=image, detections=detections)
-
-    #     # 3. Apply the blur effect using the generated masks
-    #     print("\nStep 3: Applying blur effect...")
-    #     blurred_image = blur_objects_in_image(image, segmented_detections)
-
-    #     print("Showing final image with blurred objects...")
-    #     blurred_image.show()
+    # 2. Segment detected objects with SAM
+    segmented_detections = groundingSAM.segment_batch(images=images, detections_batch=detections)

@@ -46,7 +46,7 @@ class S2Utils:
 
     def latlon_to_cell_id(self, lat, lon, level=None):
         if level is None: level = self.level
-        return s2sphere.CellId.from_lat_lng(s2sphere.LatLng.from_degrees(lat, lon)).parent(level).id()
+        return s2sphere.CellId.from_lat_lng(s2sphere.LatLng.from_degrees(lat, lon)).parent(level).id() # type: ignore
 
     def cell_id_to_latlon(self, cell_id):
         lat_lng = s2sphere.CellId(int(cell_id)).to_lat_lng()
@@ -130,7 +130,7 @@ class AdversarialNoiseGenerator:
             loss.backward()
             
             with torch.no_grad():
-                grad_sign = adversarial_tensor.grad.data.sign()
+                grad_sign = adversarial_tensor.grad.data.sign() # type: ignore
                 if target_coords: adversarial_tensor.data -= alpha * grad_sign
                 else: adversarial_tensor.data += alpha * grad_sign
                 
@@ -148,7 +148,7 @@ class AdversarialNoiseGenerator:
         """
         print(f"Applying {'Targeted' if target_coords else 'Untargeted'} PGD attack...")
         
-        image_224_tensor = self.preprocess_224(image).unsqueeze(0).to(self.device)
+        image_224_tensor = torch.Tensor(self.preprocess_224(image)).unsqueeze(0).to(self.device)
         
         perturbation_224 = self._generate_pgd_perturbation(
             image_224_tensor, target_coords, epsilon, iterations

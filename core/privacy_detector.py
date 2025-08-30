@@ -6,6 +6,7 @@ from networkx import eccentricity
 import numpy as np
 from PIL import Image, ImageOps
 from presidio_analyzer import AnalyzerEngine
+from typing import Optional, List, Dict, Any, Tuple
 from presidio_anonymizer import AnonymizerEngine
 from regex import E
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
@@ -187,7 +188,7 @@ class PrivacyDetector:
                     print(f"Image shape after pre-process: {image_np.shape}")
 
                 # store image for debugging
-                cv2.imwrite("debug_image.png", cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
+                # cv2.imwrite("debug_image.png", cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
 
                 # Run EasyOCR with optimized settings for cards/documents
                 results = self.ocr_reader.readtext(
@@ -495,6 +496,14 @@ class PrivacyDetector:
             cv2.imwrite("debug_mask.png", mask * 255)
 
         return mask
+
+    def process_image_batch(self, images: List[Image.Image]) -> List[List[Dict[str, Any]]]:
+        """Runs OCR+Presidio on a batch of images."""
+        # Your implementation here would call your OCR/Presidio backend in a loop or a batch if it supports it.
+        batch_results = []
+        for image in images:
+            batch_results.append(self.process_image(image)) # type: ignore
+        return batch_results
 
     def combined_mask(self, masks: List[np.ndarray], shape: Tuple[int, int]) -> np.ndarray:
         """Combine multiple binary masks into one"""

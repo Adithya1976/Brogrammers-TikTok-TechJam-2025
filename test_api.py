@@ -72,7 +72,7 @@ def poll_job(base_url: str, job_id: str, max_wait: float = 180.0, tick: float = 
         time.sleep(tick)
 
 
-def test_single_file(base_url: str, path: str, timeout: float = 10.0) -> None:
+def test_single_file(base_url: str, path: str, timeout: float = 10.0):
     if not os.path.exists(path):
         print(f"   ⚠️  {path} not found")
         return
@@ -90,7 +90,7 @@ def test_single_file(base_url: str, path: str, timeout: float = 10.0) -> None:
         except Exception:
             print("   ❌ Invalid JSON in 202 response")
             print(f"   Body: {r.text}")
-            return
+            return None
 
         job_id = data.get("job_id")
         status_url = data.get("status_url")
@@ -103,13 +103,13 @@ def test_single_file(base_url: str, path: str, timeout: float = 10.0) -> None:
 
         if not job_id:
             print("   ❌ Missing job_id in response; cannot poll.")
-            return
+            return None
 
         # Poll
         result = poll_job(base_url, job_id)
         print("   🎯 Final job payload:")
         print(json.dumps(result, indent=2, ensure_ascii=False))
-        return
+        return result
 
     # Back-compat: some servers might return 200 with immediate result
     if r.status_code == 200:
@@ -118,13 +118,13 @@ def test_single_file(base_url: str, path: str, timeout: float = 10.0) -> None:
             print(json.dumps(r.json(), indent=2, ensure_ascii=False))
         except Exception:
             print(r.text)
-        return
+        return None
 
     print(f"   ❌ Upload failed: HTTP {r.status_code}")
     try:
         print(f"   Body: {r.text}")
     except Exception:
-        pass
+        return None
 
 
 def test_batch(base_url: str, paths: list[str], timeout: float = 30.0) -> None:
@@ -202,15 +202,34 @@ def main():
         pass
 
     # 2) Upload(s)
-    input_files = ["IMG.png", "bedroom.mp4"]
-    is_batch = True
+    input_files = ["/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/number plates/mercedes_number_plate.png"]
+    is_batch = False
+    
     if is_batch and len(input_files) >= 1:
+        # Batch logic remains the same
         test_batch(args.base_url, input_files)
     else:
-        targets = args.files or ["bedroom.mp4"]  # default demo file
+        # Single file logic
+        targets = input_files
         for idx, path in enumerate(targets, start=2):
             print(f"\n{idx}. Upload test")
-            test_single_file(args.base_url, path)
+            # The variable `final_job_payload` will now correctly receive the result
+            final_job_payload = test_single_file(args.base_url, path)
+
+            # This `if` block will now work correctly
+            if final_job_payload and final_job_payload.get("status") == "done":
+                # Create a safe filename for the result
+                base_name = os.path.basename(path)
+                output_filename = f"result_{base_name}.json"
+                
+                with open(output_filename, "w", encoding="utf-8") as f:
+                    json.dump(final_job_payload, f, indent=2, ensure_ascii=False)
+                print(f"   💾 ✅ Final result saved to: {output_filename}")
+            elif final_job_payload:
+                print(f"   ❌ Job finished with status: {final_job_payload.get('status')}. Error: {final_job_payload.get('error')}")
+            else:
+                print("   ❌ Test function did not return a final job payload.")
+
             # respect user-configured wait per job (poller uses its own default unless you tweak it)
 
     # 3) poll a job

@@ -8,6 +8,7 @@ import cv2
 import base64
 from core.adversarial_noise import AdversarialNoiseGenerator
 import logging
+from typing import List, Dict, Any
 
 
 class ImageProcessor:

@@ -8,6 +8,7 @@ from PIL import Image
 from typing import List, Dict, Any, Tuple
 from core.privacy_detector import PrivacyDetector
 from core.object_detector import GroundingDINO_SAMModel, DetectionResult, BoundingBox
+import time
 
 
 # Configure logging
@@ -335,11 +336,10 @@ class VideoProcessor:
     Processes a video to detect, track, and generate masks for both
     visual (GroundingSAM) and text-based (OCR) entities.
     """
-    def __init__(self, grounding_sam: GroundingDINO_SAMModel, privacy_detector: PrivacyDetector, labels: List[str] = []):
+    def __init__(self, grounding_sam: GroundingDINO_SAMModel, labels: List[str] = []):
         self.visual_labels = labels
         self.grounding_sam = grounding_sam
 
-        self.privacy_detector = privacy_detector
         self.video_info = {}
 
     def process_video(self, video_path: str, max_dimension: int = 720, keyframe_threshold: int = 7, iou_threshold: float = 0.5) -> Dict[str, Any]:
@@ -383,7 +383,6 @@ class VideoProcessor:
 
                 # Get detections from both pipelines
                 visual_detections = self.grounding_sam.detect(image=current_pil_image, labels=self.visual_labels)
-                text_detections_dicts = self.privacy_detector.process_image(current_pil_image)
                 all_processed_detections: List[DetectionResult] = []
 
                 # Process and segment visual detections
@@ -394,17 +393,6 @@ class VideoProcessor:
                             setattr(det, 'type', 'visual') # Tag entity type
                             all_processed_detections.append(det)
                 
-                # Process and create box masks for text detections
-                for det_dict in text_detections_dicts:
-                    for box in det_dict['boxes']:
-                        text_dr = DetectionResult(
-                            score=det_dict.get('score', 0.95),
-                            label=det_dict['entity_name'],
-                            box=box,
-                            mask=self._create_box_mask(box, processing_height, processing_width) # Generate box mask
-                        )
-                        setattr(text_dr, 'type', 'text') # Tag entity type
-                        all_processed_detections.append(text_dr)
 
                 # --- Re-Identification Logic ---
                 if not all_processed_detections:
@@ -493,6 +481,175 @@ class VideoProcessor:
         cap.release()
         return self._finalize_output(tracked_entities)
 
+    # In your VideoProcessor class
+
+    def process_video_batch(self, video_path: str, max_dimension: int = 720, keyframe_threshold: int = 10, iou_threshold: float = 0.5, model_batch_size: int = 8) -> Dict[str, Any]:
+        """
+        Optimized video processing using a two-pass approach to maximize batching.
+        """
+        cap = cv2.VideoCapture(video_path)
+        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.video_info = {"width": original_width, "height": original_height, "fps": fps, "frame_count": frame_count}
+
+        # --- Calculate processing dimensions ---
+        if original_width > original_height:
+            processing_width = max_dimension
+            processing_height = int(original_height * (max_dimension / original_width))
+        else:
+            processing_height = max_dimension
+            processing_width = int(original_width * (max_dimension / original_height))
+
+        logging.info(f"Original resolution: {original_width}x{original_height}")
+        logging.info(f"Processing at downscaled resolution: {processing_width}x{processing_height}")
+
+        keyframe_indices = get_keyframes(video_path, threshold=keyframe_threshold)
+        
+        # ==========================================================
+        # PASS 1: BATCH PROCESS ALL KEYFRAMES
+        # ==========================================================
+        logging.info("Pass 1: Extracting and batch-processing all keyframes...")
+        
+        keyframe_images = []
+        keyframe_map = {} # Maps list index -> original frame number
+        
+        for frame_idx in keyframe_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            success, frame = cap.read()
+            if success:
+                resized_frame = cv2.resize(frame, (processing_width, processing_height), interpolation=cv2.INTER_AREA)
+                pil_image = Image.fromarray(cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB))
+                keyframe_images.append(pil_image)
+                keyframe_map[len(keyframe_images) - 1] = frame_idx
+
+        precomputed_results: Dict[int, List[DetectionResult]] = defaultdict(list)
+        if keyframe_images:
+            # --- Pass the batch_size parameter to your model methods ---
+            visual_detections_batch = self.grounding_sam.detect_batch(
+                keyframe_images, self.visual_labels, batch_size=model_batch_size
+            )
+            segmented_visuals_batch = self.grounding_sam.segment_batch(
+                keyframe_images, visual_detections_batch, batch_size=model_batch_size
+            )
+            
+            for i in range(len(keyframe_images)):
+                frame_num = keyframe_map[i]
+                if segmented_visuals_batch[i]:
+                    for det in segmented_visuals_batch[i]:
+                        setattr(det, 'type', 'visual')
+                        precomputed_results[frame_num].append(det) # type: ignore
+        
+        logging.info(f"Pass 1 complete. Processed {len(keyframe_images)} keyframes in batches.")
+
+        # ==========================================================
+        # PASS 2: SEQUENTIAL TRACKING & RE-IDENTIFICATION
+        # ==========================================================
+        logging.info("Pass 2: Performing frame-by-frame tracking and association...")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Rewind video for second pass
+        
+        tracked_entities: Dict[int, Dict[str, Any]] = {}
+        next_entity_id = 0
+        frame_number = 0
+
+        # --- START OF COPIED LOGIC FROM process_video ---
+        while True:
+            success, frame = cap.read()
+            if not success:
+                break
+
+            resized_frame = cv2.resize(frame, (processing_width, processing_height), interpolation=cv2.INTER_AREA)
+            current_pil_image = Image.fromarray(cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB))
+
+            if frame_number in keyframe_indices:
+                logging.info(f"--- Keyframe {frame_number}: Re-identifying entities from pre-computed results ---")
+
+                # === THE ONLY CHANGE IS HERE ===
+                # Instead of running detection, we retrieve the pre-computed results.
+                all_processed_detections = precomputed_results.get(frame_number, [])
+                # ==============================
+
+                # --- The rest of the re-identification logic is identical ---
+                if not all_processed_detections:
+                    for entity in tracked_entities.values(): entity['active'] = False
+                else:
+                    active_entity_ids = [eid for eid, e in tracked_entities.items() if e['active']]
+                    matched_detection_indices = set()
+
+                    for entity_id in active_entity_ids:
+                        entity = tracked_entities[entity_id]
+                        best_match_iou, best_match_idx = -1, -1
+                        for i, det in enumerate(all_processed_detections):
+                            iou = calculate_iou(entity['box'], det.box)
+                            if iou > iou_threshold and iou > best_match_iou:
+                                best_match_iou, best_match_idx = iou, i
+                        
+                        if best_match_idx != -1:
+                            detection = all_processed_detections[best_match_idx]
+                            tracker = cv2.TrackerCSRT_create() # type: ignore
+                            tracker_box = (int(detection.box.xmin), int(detection.box.ymin), int(detection.box.xmax - detection.box.xmin), int(detection.box.ymax - detection.box.ymin))
+                            tracker.init(resized_frame, tracker_box)
+                            entity.update({'tracker': tracker, 'box': detection.box})
+                            entity['masks'].append((frame_number, detection.mask))
+                            matched_detection_indices.add(best_match_idx)
+                        else:
+                            entity['active'] = False
+                    
+                    for i, det in enumerate(all_processed_detections):
+                        if i not in matched_detection_indices:
+                            tracker = cv2.TrackerCSRT_create() # type: ignore
+                            tracker_box = (int(det.box.xmin), int(det.box.ymin), int(det.box.xmax - det.box.xmin), int(det.box.ymax - det.box.ymin))
+                            tracker.init(resized_frame, tracker_box)
+                            tracked_entities[next_entity_id] = {
+                                'label': det.label,
+                                'type': getattr(det, 'type'),
+                                'tracker': tracker,
+                                'box': det.box,
+                                'masks': [(frame_number, det.mask)],
+                                'active': True
+                            }
+                            logging.info(f"New entity {next_entity_id} ({det.label}, type: {getattr(det, 'type')}) detected.")
+                            next_entity_id += 1
+            else:
+                # --- Intermediate Frame logic is identical ---
+                active_entities = [e for e in tracked_entities.values() if e['active']]
+                if active_entities:
+                    boxes_to_process, entity_map = [], []
+                    for entity in active_entities:
+                        success, box = entity['tracker'].update(resized_frame)
+                        if success:
+                            x1, y1, w, h = [int(v) for v in box]
+                            entity['box'] = BoundingBox(xmin=x1, ymin=y1, xmax=x1 + w, ymax=y1 + h)
+                            boxes_to_process.append(DetectionResult(score=0.99, label=entity['label'], box=entity['box']))
+                            entity_map.append(entity)
+                        else:
+                            entity['active'] = False
+
+                    visual_entities_to_segment, visual_entity_map = [], []
+                    for i, det_result in enumerate(boxes_to_process):
+                        entity = entity_map[i]
+                        if entity['type'] == 'visual':
+                            visual_entities_to_segment.append(det_result)
+                            visual_entity_map.append(entity)
+                        elif entity['type'] == 'text':
+                            box_mask = self._create_box_mask(det_result.box, processing_height, processing_width)
+                            entity['masks'].append((frame_number, box_mask))
+                    
+                    if visual_entities_to_segment:
+                        # NOTE: Segmentation on intermediate frames is not batched, which is correct
+                        # as it depends on the immediately preceding tracker state.
+                        segmented_results = self.grounding_sam.segment(current_pil_image, visual_entities_to_segment)
+                        if segmented_results:
+                            for i, seg_det in enumerate(segmented_results):
+                                visual_entity_map[i]['masks'].append((frame_number, seg_det.mask))
+            
+            if frame_number % fps == 0: logging.info(f"Processed {frame_number}/{frame_count} frames...")
+            frame_number += 1
+            
+        cap.release()
+        return self._finalize_output(tracked_entities)
+
     def _finalize_output(self, tracked_entities: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
         """
         Upscale (if needed) and structure the final output data.
@@ -502,7 +659,7 @@ class VideoProcessor:
             Dict[str, Any]: The structured output data.
         """
         output_entities = []
-        upsampled_entities = upsample_entity_masks(entity_data=tracked_entities, original_width=self.video_info['width'], original_height=self.video_info['height'])
+        upsampled_entities = upsample_entity_masks(entity_data=tracked_entities, original_width=self.video_info['width'], original_height=self.video_info['height']) # type: ignore
         for entity_id, entity_data in upsampled_entities.items():
             if not entity_data['masks']: continue
             frame_nums, masks = zip(*entity_data['masks'])
@@ -539,12 +696,14 @@ class VideoProcessor:
 
 
 if __name__ == '__main__':
-    video_file_path = '/Users/adithyasamudrala/Brogrammers-TikTok-TechJam-2025/bedroom.mp4'
+    video_file_path = '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/videos/bedroom.mp4'
     labels_to_process = []
 
+    start_time = time.time()
+
     # --- STAGE 1: EXPENSIVE PROCESSING ---
-    processor = VideoProcessor(labels=labels_to_process)
-    individual_entity_data = processor.process_video(video_file_path)
+    processor = VideoProcessor(labels=labels_to_process, grounding_sam=GroundingDINO_SAMModel())
+    individual_entity_data = processor.process_video_batch(video_file_path, model_batch_size=4)
 
     # --- STAGE 2: INSPECT THE OUTPUT ---
     print("\n--- Final Structured Output for Individual Entities ---")
@@ -562,5 +721,9 @@ if __name__ == '__main__':
         print(f"  Mask Video Shape: {entity['mask_video'].shape}") # Should be (end-start+1, H, W) or similar
         print("-" * 20)
 
-    output_video_path = 'bedroom_processed.mp4'
-    create_debug_video(original_video_path=video_file_path, entity_data=individual_entity_data, output_path=output_video_path)
+    # output_video_path = '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/videos/bedroom_processed.mp4'
+    # create_debug_video(original_video_path=video_file_path, entity_data=individual_entity_data, output_path=output_video_path)
+
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Total processing time: {elapsed_time:.2f} seconds")
