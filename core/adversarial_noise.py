@@ -20,7 +20,7 @@ class S2Utils:
     Correctly maps all 100,000 locations from the training data, where the
     class_id is the row index.
     """
-    def init(self, level=6, expected_num_classes=None):
+    def __init__(self, level=6, expected_num_classes=None):
         self.level = level
         self.class_to_latlon_map = self._get_class_to_latlon_map(expected_num_classes)
         self.s2_to_class_map = self._get_s2_to_class_map(self.class_to_latlon_map, level)
@@ -29,7 +29,7 @@ class S2Utils:
         print("✓ Pre-calculation complete.")
 
     def _get_class_to_latlon_map(self, expected_num_classes):
-        package_path = os.path.dirname(geoclip.file)
+        package_path = os.path.dirname(geoclip.__file__)
         source_csv_path = os.path.join(package_path, 'model', 'gps_gallery', 'coordinates_100K.csv')
         df = pd.read_csv(source_csv_path)
         if expected_num_classes is not None and len(df) > expected_num_classes:
@@ -75,7 +75,7 @@ class AdversarialNoiseGenerator:
     A self-contained class to generate high-resolution adversarial noise for images
     using the GeoCLIP model.
     """
-    def init(self):
+    def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         print(f"Initializing AdversarialNoiseGenerator on device: {self.device}")
         
