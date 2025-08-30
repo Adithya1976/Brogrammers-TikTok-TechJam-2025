@@ -1,16 +1,20 @@
 from textwrap import indent
 import traceback
+from unittest import result
 import cv2
+from networkx import eccentricity
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
+from regex import E
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-from typing import List, Dict, Tuple
+from typing import List, Dict, Sequence, Tuple, Type
 import io
 import time
 import json
 import re
+import math
 
 from sympy import im
 
@@ -19,27 +23,30 @@ try:
     import easyocr
     import torch
     OCR_BACKEND = 'easyocr'
-    print("🔍 EasyOCR available")
+    # print("🔍 EasyOCR available")
 except ImportError:
     OCR_BACKEND = 'demo'
     print("⚠️ EasyOCR not available, using demo mode")
 
 class PrivacyDetector:
-    def __init__(self):
+    def __init__(self, debug: bool = False, use_gpu: bool = True):
         self.analyzer = AnalyzerEngine()
         self.anonymizer = AnonymizerEngine()
         self.ocr_reader = None
+        self.debug = debug
         
         # Check GPU availability
-        self.gpu_available = torch.cuda.is_available() or torch.mps.is_available()
+        self.gpu_available = use_gpu and (torch.cuda.is_available() or torch.backends.mps.is_available())
         
         # Initialize EasyOCR
         self.ocr_backend = OCR_BACKEND
         if self.ocr_backend == 'easyocr':
             try:
-                print(f"🚀 Initializing EasyOCR with {'GPU' if self.gpu_available else 'CPU'} support...")
+                if self.debug:
+                    print(f"🚀 Initializing EasyOCR with {'GPU' if self.gpu_available else 'CPU'} support...")
                 self.ocr_reader = easyocr.Reader(['en'], gpu=self.gpu_available, verbose=False)
-                print(f"✅ EasyOCR initialized successfully on {'GPU' if self.gpu_available else 'CPU'}")
+                if self.debug:
+                    print(f"✅ EasyOCR initialized successfully on {'GPU' if self.gpu_available else 'CPU'}")
             except Exception as e:
                 print(f"⚠️ EasyOCR initialization failed: {e}")
                 self.ocr_backend = 'demo'
@@ -167,24 +174,17 @@ class PrivacyDetector:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
         return cv2.dilate(binary, kernel, iterations=1)
         
-    def extract_text_from_image(self, image_bytes: bytes, filename: str = None) -> str:
+    def extract_text_from_image(self, image_np, filename: str = None) -> str:
         """Extract text from image using EasyOCR"""
         try:
-            image = Image.open(io.BytesIO(image_bytes))
             
             if self.ocr_backend == 'easyocr' and self.ocr_reader:
-                print("🔍 Running EasyOCR..."   )
                 # Preprocess image for better OCR results
                 # image_np = self._preprocess_image_for_easyocr(image)
-                if image.mode != 'RGB':
-                    image = image.convert('RGB')
-                image_np = np.array(image)
-                
-                # rotate image clockwise
-                image_np = cv2.rotate(image_np, cv2.ROTATE_90_CLOCKWISE)
 
                 # print shape of image
-                print(f"Image shape after pre-process: {image_np.shape}")
+                if self.debug:
+                    print(f"Image shape after pre-process: {image_np.shape}")
 
                 # store image for debugging
                 cv2.imwrite("debug_image.png", cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
@@ -193,19 +193,21 @@ class PrivacyDetector:
                 results = self.ocr_reader.readtext(
                     image_np
                 )
-                
-                parts, boxes = [], []
+
+                parts, boxes, confidences = [], [], []
                 for bbox, text, confidence in results:
                     t = (text or "").strip()
                     if confidence > 0.4 and t:
                         parts.append(t)
                         boxes.append(bbox)
+                        confidences.append(confidence)
+
 
                 span_to_bb = {}
                 extracted_chunks = []
                 pos = 0  # running char position in the final string
 
-                for i, (t, bb) in enumerate(zip(parts, boxes)):
+                for i, (t, bb, conf) in enumerate(zip(parts, boxes, confidences)):
                     if i > 0:
                         # account for the single space inserted by `' '.join`
                         extracted_chunks.append(" ")
@@ -214,7 +216,11 @@ class PrivacyDetector:
                     extracted_chunks.append(t)
                     pos += len(t)
                     # map (start, end+1) -> bbox
-                    span_to_bb[(start, pos)] = bb
+                    span_to_bb[(start, pos)] = {
+                        "box": bb,
+                        "confidence": conf
+                    }
+                    
 
                 return ''.join(extracted_chunks), span_to_bb
             
@@ -245,7 +251,7 @@ class PrivacyDetector:
     def analyze_privacy(self, text: str) -> Dict:
         """Analyze text for privacy-sensitive information"""
         if not text:
-            return {"entities": [], "score": 0, "is_safe": True}
+            return []
         
         # text = text.replace("/", " ")
         # Run Presidio analysis
@@ -275,148 +281,208 @@ class PrivacyDetector:
         for result in results:
             entity_type = result.entity_type
             confidence = result.score
-            
-            # Calculate weighted score based on entity type and confidence
-            if entity_type in HIGH_RISK_ENTITIES:
-                weight = 3.0
-            elif entity_type in MEDIUM_RISK_ENTITIES:
-                weight = 1.5
-            elif entity_type in LOW_RISK_ENTITIES:
-                weight = 0.5
-            else:
-                weight = 2.0  # Unknown entities get medium-high weight
-            
-            entity_score = confidence * weight
-            privacy_score += entity_score
+
             
             entities.append({
                 "type": entity_type,
                 "start": result.start,
                 "end": result.end,
                 "text": text[result.start:result.end],
+                "confidence": confidence,
+                "span_len": int(result.end - result.start)
             })
-            print(f"Detected entity: {entity_type} ({text[result.start:result.end]})")
+            if self.debug:
+                print(f"Detected entity: {entity_type} ({text[result.start:result.end]})")
     
         
         return entities
     
-    def _detect_card_patterns(self, text: str) -> List[Dict]:
-        """Detect specific card patterns that might be missed by Presidio"""
-        patterns = []
-        
-        # Credit card patterns
-        cc_pattern = r'\b(?:\d{4}[\s-]?){3}\d{4}\b'
-        for match in re.finditer(cc_pattern, text):
-            patterns.append({
-                "type": "CREDIT_CARD",
-                "confidence": 0.9,
-                "start": match.start(),
-                "end": match.end(),
-                "text": match.group(),
-                "risk_level": "high"
-            })
-        
-        # ID number patterns (various formats)
-        id_patterns = [
-            r'\b[A-Z]\d{8,9}\b',  # Driver license format
-            r'\b\d{2}/\d{2}/\d{4}\b',  # Date format (birth date, expiry)
-            r'\bIssued on\s+\d{2}/\d{2}/\d{4}\b',  # Issue date
-            r'\b[A-Z]{2,}\s+\d{6,}\b',  # ID with letters and numbers
-        ]
-        
-        for pattern in id_patterns:
-            for match in re.finditer(pattern, text, re.IGNORECASE):
-                patterns.append({
-                    "type": "ID_NUMBER",
-                    "confidence": 0.8,
-                    "start": match.start(),
-                    "end": match.end(),
-                    "text": match.group(),
-                    "risk_level": "high"
-                })
-        
-        # Card type indicators
-        card_indicators = ['VISA', 'MASTERCARD', 'AMEX', 'DISCOVER', 'DBS', 'PLATINUM', 'MULTI-CURRENCY']
-        for indicator in card_indicators:
-            if indicator in text.upper():
-                patterns.append({
-                    "type": "FINANCIAL_CARD",
-                    "confidence": 0.95,
-                    "start": 0,
-                    "end": len(indicator),
-                    "text": indicator,
-                    "risk_level": "high"
-                })
-        
-        return patterns
-    
-    def process_image(self, image_bytes: bytes, filename: str = None) -> Dict:
+    def process_image(self, image: Image, filename: str = None) -> List[Dict]:
         try:
-            """Complete privacy analysis pipeline for images with performance tracking"""
+            """Multi-rotation OCR → Presidio → entity-wise dedupe by bigger-span + overlap-over-min."""
             start_time = time.time()
-            result = []
-            
-            # Extract text
-            ocr_start = time.time()
-            image = Image.open(io.BytesIO(image_bytes))
-            shape = image.size
-            ocr_text, span_to_bb = self.extract_text_from_image(image_bytes, filename)
-            ocr_time = time.time() - ocr_start
-            
-            print(f"OCR Text: '{ocr_text}'")
-            # Analyze privacy
-            analysis_start = time.time()
-            detection_list = self.analyze_privacy(ocr_text)
-            analysis_time = time.time() - analysis_start
 
-            mask_list = []
+            # ---------------- helpers ----------------
+            def rotate_image_keep_canvas(img_np: np.ndarray, angle_deg: float) -> np.ndarray:
+                h, w = img_np.shape[:2]
+                M = cv2.getRotationMatrix2D((w/2.0, h/2.0), angle_deg, 1.0)
+                return cv2.warpAffine(img_np, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-            # print span_to_bb keys and text for debugging
-            print("Span to BB mapping:")
-            for (s, e), bb in span_to_bb.items():
-                print(f"  ({s}, {e}): ocr_text='{ocr_text[s:e]}'")
+            def rotate_point(px: float, py: float, cx: float, cy: float, angle_deg: float) -> tuple[float, float]:
+                ang = math.radians(angle_deg)
+                ca, sa = math.cos(ang), math.sin(ang)
+                x0, y0 = px - cx, py - cy
+                return (x0*ca - y0*sa + cx, x0*sa + y0*ca + cy)
 
+            def map_bbox_to_original(bb4: list[list[float]], w: int, h: int, angle_applied_deg: float) -> list[list[int]]:
+                """bb4 is in rotated frame (angle_applied_deg applied). Map back by rotating -angle."""
+                cx, cy = w/2.0, h/2.0
+                inv = -angle_applied_deg
+                mapped = [rotate_point(x, y, cx, cy, inv) for (x, y) in bb4]
+                return [[int(round(x)), int(round(y))] for (x, y) in mapped]
 
-            # map bounding boxes to entities
-            for detection in detection_list:
-                start, end = detection['start'], detection['end']
-                text = detection['text']
-                target_entity = detection['type']
-                # get all keys in span_to_bb that lie within (start, end)
-                bb_list = [bb for (s, e), bb in span_to_bb.items() if s >= start and e <= end]
+            def union_mask(boxes: list[list[list[int]]], H: int, W: int) -> np.ndarray:
+                m = np.zeros((H, W), dtype=np.uint8)
+                for bb in boxes:
+                    m = np.maximum(m, self.convert_bb_to_mask(bb, (H, W)))
+                return m
 
-                for bb in bb_list:
-                    # convert bb to image mask
-                    mask = self.convert_bb_to_mask(bb, shape)
-                    mask_list.append(mask)
+            def mask_overlap_over_min(a: np.ndarray, b: np.ndarray) -> float:
+                inter = np.logical_and(a, b).sum()
+                sa, sb = a.sum(), b.sum()
+                denom = min(sa, sb)
+                return (inter / denom) if denom > 0 else 0.0
 
-                    result.append({
-                        "text": text,
-                        "bounding_box": bb,
-                        "entity_type": target_entity,
-                        "mask": mask.tolist()
-                    })
-
-            combined_mask = self.combined_mask(mask_list, shape)
-            
-            # mask the image out and save for debugging
+            # ---------------- image prep ----------------
+            image = ImageOps.exif_transpose(image)
             image_np = np.array(image)
-            # rotate image clockwise
-            image_np = cv2.rotate(image_np, cv2.ROTATE_90_CLOCKWISE)
-            print(image_np.shape)
-            print(combined_mask.shape)
+            H, W = image_np.shape[:2]
+
+            angles = list(range(0, 360, 45))  # includes 0
+
+            # Final kept entities (original frame)
+            # each: {entity_type, text, start, end, span_len, boxes: [bb...]}
+            best_entities: List[Dict] = []
+            entity_masks: List[np.ndarray] = []  # cache union mask per entity
+
+            def add_or_replace_entity(cand: Dict, entity_overlap_thr: float = 0.6):
+                """Replace existing entities if cand is bigger-span AND overlap-over-min >= thr.
+                Else, if tie & same (type+text), union boxes; otherwise keep existing."""
+                # Prepare candidate mask
+                cand_mask = union_mask(cand["boxes"], H, W)
+
+                # Find overlaps (by overlap-over-min on masks)
+                overlaps = []
+                for idx, ex_mask in enumerate(entity_masks):
+                    overlap = mask_overlap_over_min(ex_mask, cand_mask)
+                    if overlap >= entity_overlap_thr:
+                        overlaps.append((idx, overlap))
+
+                if not overlaps:
+                    # no strong overlap → new entity
+                    best_entities.append(cand)
+                    entity_masks.append(cand_mask)
+                    return
+                
+
+                # There is at least one overlapping existing entity
+                # Check if ANY overlapping existing has span_len >= candidate
+                max_span = max(best_entities[i]["span_len"] for i, _ in overlaps)
+                if cand["span_len"] > max_span:
+                    # Candidate is bigger → remove all overlapped entities, then add candidate
+                    to_remove = sorted([i for i, _ in overlaps], reverse=True)
+
+                    # print the overlapped entity type and text that are to be removed
+                    for i in to_remove:
+                        best_entities.pop(i)
+                        entity_masks.pop(i)
+                    best_entities.append(cand)
+                    entity_masks.append(cand_mask)
+                    return
+
+                # Tie or smaller: keep existing.
+                # Optional: if tie AND clearly same semantic entity → union boxes into the best-overlap one
+                # (same type + same text)
+                if cand["span_len"] == max_span:
+                    # choose the existing with max overlap
+                    best_idx = max(overlaps, key=lambda t: t[1])[0]
+                    ex = best_entities[best_idx]
+                    if (ex["entity_type"] == cand["entity_type"]) and (ex["text"] == cand["text"]):
+                        ex["boxes"].extend(cand["boxes"])
+                        # refresh mask
+                        entity_masks[best_idx] = np.maximum(entity_masks[best_idx], cand_mask)
+                # If smaller span, we ignore cand entirely.
+
+            # ---------------- per-rotation pass ----------------
+            for angle in angles:
+                t0 = time.time()
+                rotated_np = rotate_image_keep_canvas(image_np, angle)
+
+                if self.debug:
+                    cv2.imwrite(f"debug_rotated_{angle}.png", cv2.cvtColor(rotated_np, cv2.COLOR_RGB2BGR))
+
+                # OCR (you provide this)
+                ocr_text, span_to_bb = self.extract_text_from_image(rotated_np, filename)
+
+                if self.debug:
+                    print(f"[{angle:3d}] OCR len={len(ocr_text)} span_count={len(span_to_bb)}")
+
+                # Presidio on this rotation
+                dets = self.analyze_privacy(ocr_text)
+
+                # Build candidate entities for this rotation
+                rotation_candidates: List[Dict] = []
+                for d in dets:
+                    start, end, text_span = d["start"], d["end"], d["text"]
+                    ent_type, span_len = d["type"], d["span_len"]
+
+                    boxes, text = [], []
+                    for (s, e), bb_dict in span_to_bb.items():
+                        # change it to partial match (within)
+                        if not (s < end and e > start):
+                            bb_rot = bb_dict.get("box")
+                            bb_orig = map_bbox_to_original(bb_rot, W, H, -angle)
+                            boxes.append(bb_orig)
+                            text.append(ocr_text[s:e])
+
+                    if boxes:
+                        rotation_candidates.append({
+                            "entity_type": ent_type,
+                            "text": text_span,
+                            "start": start,
+                            "end": end,
+                            "span_len": span_len,
+                            "boxes": boxes,
+                        })
+
+                # Merge each candidate using bigger-span + overlap-over-min rule
+                for cand in rotation_candidates:
+                    add_or_replace_entity(cand, entity_overlap_thr=0.6)
+
+                if getattr(self, "debug", False):
+                    print(f"[{angle:3d}] kept_entities={len(best_entities)} took={time.time()-t0:.2f}s")
+                
+                # draw all current best_entities on a debug image
+                if getattr(self, "debug", False):
+                    debug_img = image_np.copy()
+                    for ent in best_entities:
+                        color = (0, 255, 0)
+                        for bb in ent["boxes"]:
+                            pts = np.array(bb, dtype=np.int32).reshape((-1, 1, 2))
+                            cv2.polylines(debug_img, [pts], isClosed=True, color=color, thickness=2)
+                            # put entity type text near the first point
+                            cv2.putText(debug_img, ent["entity_type"], tuple(pts[0][0]), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    cv2.imwrite(f"debug_best_entities_after_{angle}.png", cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR))
+
+            # ---------------- finalize masks & output ----------------
+            combined_mask = np.zeros((H, W), dtype=np.uint8)
+            for ent_idx, ent in enumerate(best_entities):
+                m = union_mask(ent["boxes"], H, W)
+                ent["mask"] = m
+                combined_mask = np.maximum(combined_mask, m)
+
             masked_image = image_np.copy()
             masked_image[combined_mask == 1] = 0
-            cv2.imwrite("debug_masked_image.png", cv2.cvtColor(masked_image, cv2.COLOR_RGB2BGR))
+            if getattr(self, "debug", False):
+                cv2.imwrite("debug_masked_image.png", cv2.cvtColor(masked_image, cv2.COLOR_RGB2BGR))
+                print("=== Final Entities ===")
+                for e in best_entities:
+                    print(f"  {e['entity_type']} span={e['span_len']} boxes={len(e['boxes'])}")
 
-            # print result's text and entity type
-            for res in result:
-                print(f"Text: {res['text']}, Entity Type: {res['entity_type']}")
-            total_time = time.time() - start_time
-        except Exception as e:
-            print(f"Processing Error: {e}")
+            # Return serialized masks (swap to PNG/RLE if desired)
+            results_output = [
+                {
+                    "entity_name": e["entity_type"],
+                    "mask": e["mask"],
+                    "boxes": e["boxes"]
+                }
+                for e in best_entities
+            ]
+            return results_output
+
+        except Exception as ex:
             traceback.print_exc()
-            return {}
+            raise Exception(f"Processing error: {ex}")
 
     def convert_bb_to_mask(self, bb: List[List[np.float64]], image_shape: Tuple[int, int] = (1024, 1024)) -> np.ndarray:
         """Convert bounding box to binary mask"""
@@ -424,8 +490,9 @@ class PrivacyDetector:
         pts = np.array(bb, dtype=np.int32).reshape((-1, 1, 2))
         cv2.fillPoly(mask, [pts], 1)
 
-        # save mask for debugging
-        cv2.imwrite("debug_mask.png", mask * 255)
+        if self.debug:
+            # save mask for debugging
+            cv2.imwrite("debug_mask.png", mask * 255)
 
         return mask
 
@@ -437,4 +504,3 @@ class PrivacyDetector:
         # save combined mask for debugging
         cv2.imwrite("debug_combined_mask.png", combined * 255)
         return combined
-        

@@ -1,103 +1,218 @@
 #!/usr/bin/env python3
 """
-Test the TasksAI Privacy Pipeline API
-"""
-import requests
-import time
-import os
+Test the TasksAI Privacy Pipeline API (matches 202 + job polling behavior).
 
-def test_server():
-    """Test the server with sample images"""
-    base_url = "http://localhost:8000"
-    
-    print("🧪 Testing TasksAI Privacy Pipeline API")
-    print("=" * 40)
-    
-    # Test health check
+Usage:
+  python test_api.py --base http://localhost:8000 IMG_8414.JPG
+  python test_api.py --base http://localhost:8000 --batch sample1.jpg sample2.jpg
+
+Notes:
+- /process returns 202 + {"job_id", "status_url"} and we poll /jobs/{job_id}
+- /api/health is used to verify server status
+- Batch mode hits /api/process-batch and polls the same /jobs/{job_id}
+"""
+import argparse
+import json
+import mimetypes
+import os
+import time
+from typing import Dict, Optional
+
+import requests
+
+
+def join_url(base: str, path: str) -> str:
+    base = base.rstrip("/")
+    path = path if path.startswith("/") else f"/{path}"
+    return f"{base}{path}"
+
+
+def get_health(base_url: str, timeout: float = 5.0) -> Optional[Dict]:
     try:
-        print("1. Testing health check...")
-        response = requests.get(f"{base_url}/api/health", timeout=5)
-        if response.status_code == 200:
-            health = response.json()
-            print(f"   ✅ Server healthy: {health['server']}")
-            print(f"   GPU: {health['gpu_name']}")
-        else:
-            print(f"   ❌ Health check failed: {response.status_code}")
-            return
+        r = requests.get(join_url(base_url, "/api/health"), timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+        print(f"   ❌ /api/health failed: HTTP {r.status_code}")
+        try:
+            print(f"   Body: {r.text}")
+        except Exception:
+            pass
     except requests.exceptions.ConnectionError:
-        print("   ❌ Server not running. Start with: python start_server.py")
-        return
+        print("   ❌ Server not running. Start it (e.g.,: python start_server.py)")
     except Exception as e:
         print(f"   ❌ Health check error: {e}")
+    return None
+
+
+def detect_mime(path: str) -> str:
+    mt, _ = mimetypes.guess_type(path)
+    # default to image/jpeg if unknown; FastAPI will still use filename
+    return mt or "application/octet-stream"
+
+
+def poll_job(base_url: str, job_id: str, max_wait: float = 180.0, tick: float = 1.0) -> Dict:
+    """Poll /jobs/{job_id} until status in {'done','error'} or timeout."""
+    url = join_url(base_url, f"/jobs/{job_id}")
+    start = time.time()
+    last_status = None
+    while True:
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            raise RuntimeError(f"Job GET failed: HTTP {r.status_code} {r.text}")
+        payload = r.json()
+        status = payload.get("status")
+        if status != last_status:
+            print(f"   ⏱️  Job status: {status}")
+            last_status = status
+        if status in ("done", "error"):
+            return payload
+        if time.time() - start > max_wait:
+            raise TimeoutError(f"Timed out waiting for job {job_id}")
+        time.sleep(tick)
+
+
+def test_single_file(base_url: str, path: str, timeout: float = 10.0) -> None:
+    if not os.path.exists(path):
+        print(f"   ⚠️  {path} not found")
         return
-    
-    # Test system info
+
+    print(f"\n▶️  Testing single file: {path}")
+    ctype = detect_mime(path)
+    with open(path, "rb") as f:
+        files = {"file": (os.path.basename(path), f, ctype)}
+        r = requests.post(join_url(base_url, "/process"), files=files, timeout=timeout)
+
+    # Expect 202 with job id
+    if r.status_code == 202:
+        try:
+            data = r.json()
+        except Exception:
+            print("   ❌ Invalid JSON in 202 response")
+            print(f"   Body: {r.text}")
+            return
+
+        job_id = data.get("job_id")
+        status_url = data.get("status_url")
+        loc_header = r.headers.get("Location")
+        print(f"   ✅ Enqueued (job_id={job_id})")
+        if status_url:
+            print(f"   📍 Status URL (body): {status_url}")
+        if loc_header:
+            print(f"   📍 Status URL (Location header): {loc_header}")
+
+        if not job_id:
+            print("   ❌ Missing job_id in response; cannot poll.")
+            return
+
+        # Poll
+        result = poll_job(base_url, job_id)
+        print("   🎯 Final job payload:")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    # Back-compat: some servers might return 200 with immediate result
+    if r.status_code == 200:
+        print("   ⚠️ Received 200 OK (immediate result). Body:")
+        try:
+            print(json.dumps(r.json(), indent=2, ensure_ascii=False))
+        except Exception:
+            print(r.text)
+        return
+
+    print(f"   ❌ Upload failed: HTTP {r.status_code}")
     try:
-        print("\n2. Testing system info...")
-        response = requests.get(f"{base_url}/api/system-info", timeout=5)
-        if response.status_code == 200:
-            info = response.json()
-            print(f"   ✅ System info retrieved")
-            print(f"   CPU Cores: {info['system']['cpu_cores']}")
-            print(f"   RAM: {info['system']['ram_gb']} GB")
-        else:
-            print(f"   ❌ System info failed: {response.status_code}")
-    except Exception as e:
-        print(f"   ❌ System info error: {e}")
-    
-    # Test file processing
-    test_files = ['sample_safe.jpg', 'sample_private.jpg', 'sample_mixed.jpg']
-    test_files = ['IMG_8412.JPG']
-    
-    for i, filename in enumerate(test_files, 3):
-        if os.path.exists(filename):
-            print(f"\n{i}. Testing {filename}...")
+        print(f"   Body: {r.text}")
+    except Exception:
+        pass
+
+
+def test_batch(base_url: str, paths: list[str], timeout: float = 30.0) -> None:
+    print(f"\n▶️  Testing batch upload: {len(paths)} files")
+    files = []
+    to_close = []
+    try:
+        for p in paths:
+            if not os.path.exists(p):
+                print(f"   ⚠️  Skipping missing file: {p}")
+                continue
+            f = open(p, "rb")
+            to_close.append(f)
+            files.append(("files", (os.path.basename(p), f, detect_mime(p))))
+
+        if not files:
+            print("   ❌ No valid files for batch.")
+            return
+
+        r = requests.post(join_url(base_url, "/api/process-batch"), files=files, timeout=timeout)
+
+        if r.status_code != 202:
+            print(f"   ❌ Batch enqueue failed: HTTP {r.status_code}")
+            print(f"   Body: {r.text}")
+            return
+
+        data = r.json()
+        job_id = data.get("job_id")
+        print(f"   ✅ Batch enqueued (job_id={job_id})")
+        if not job_id:
+            print("   ❌ Missing job_id in batch response; cannot poll.")
+            return
+
+        result = poll_job(base_url, job_id, max_wait=600.0)  # batches can take longer
+        print("   🎯 Final batch job payload:")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+
+    finally:
+        for f in to_close:
             try:
-                with open(filename, 'rb') as f:
-                    files = {'file': (filename, f, 'image/jpeg')}
-                    response = requests.post(f"{base_url}/process", files=files, timeout=10)
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    print(result)
-                else:
-                    print(f"   ❌ Processing failed: {response.status_code}")
-                    print(f"   Error: {response.text}")
-            except Exception as e:
-                print(f"   ❌ Processing error: {e}")
-        else:
-            print(f"\n{i}. ⚠️ {filename} not found (run: python demo.py)")
-    
-    # Test gallery
-    # try:
-    #     print(f"\n{len(test_files) + 3}. Testing gallery...")
-    #     response = requests.get(f"{base_url}/api/gallery", timeout=5)
-    #     if response.status_code == 200:
-    #         gallery = response.json()
-    #         print(f"   ✅ Gallery retrieved: {gallery['total']} items")
-    #     else:
-    #         print(f"   ❌ Gallery failed: {response.status_code}")
-    # except Exception as e:
-    #     print(f"   ❌ Gallery error: {e}")
-    
-    # Test performance stats
+                f.close()
+            except Exception:
+                pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Test TasksAI Privacy Pipeline API")
+    parser.add_argument(
+        "--base", dest="base_url", default="http://localhost:8000", help="Base URL of the API"
+    )
+    parser.add_argument(
+        "--batch", action="store_true", help="Send all provided files as a single batch job"
+    )
+    parser.add_argument(
+        "--wait", type=float, default=180.0, help="Max seconds to wait for single job"
+    )
+    parser.add_argument("files", nargs="*", help="Image/video files to upload")
+    args = parser.parse_args()
+
+    print("🧪 Testing TasksAI Privacy Pipeline API")
+    print("=" * 40)
+
+    # 1) Health
+    print("1. Testing health check...")
+    health = get_health(args.base_url)
+    if not health:
+        return
     try:
-        print(f"\n{len(test_files) + 4}. Testing performance stats...")
-        response = requests.get(f"{base_url}/api/stats", timeout=5)
-        if response.status_code == 200:
-            stats = response.json()
-            print(f"   ✅ Stats retrieved")
-            print(f"   Uptime: {stats.get('uptime_seconds', 0)}s")
-            print(f"   Total Requests: {stats.get('total_requests', 0)}")
-            if 'processing_time' in stats:
-                print(f"   Avg Processing Time: {stats['processing_time'].get('avg', 'N/A')}s")
-        else:
-            print(f"   ❌ Stats failed: {response.status_code}")
-    except Exception as e:
-        print(f"   ❌ Stats error: {e}")
-    
+        print(f"   ✅ Server: {health.get('server', 'unknown')} (v{health.get('version','?')})")
+        gpu_name = health.get("gpu_name") or health.get("gpu") or health.get("gpu_model")
+        if gpu_name:
+            print(f"   GPU: {gpu_name}")
+    except Exception:
+        pass
+
+    # 2) Upload(s)
+    if args.batch and len(args.files) >= 1:
+        test_batch(args.base_url, args.files)
+    else:
+        targets = args.files or ["IMG.png"]  # default demo file
+        for idx, path in enumerate(targets, start=2):
+            print(f"\n{idx}. Upload test")
+            test_single_file(args.base_url, path)
+            # respect user-configured wait per job (poller uses its own default unless you tweak it)
+
+
     print("\n🎯 API Testing Complete!")
-    print(f"📱 Mobile app can connect to: http://YOUR_LAPTOP_IP:8000/api/")
+    print("📱 Mobile app can connect to: http://YOUR_LAPTOP_IP:8000/api/")
+
 
 if __name__ == "__main__":
-    test_server()
+    main()
