@@ -6,14 +6,14 @@ from PIL import Image
 import numpy as np
 import cv2
 import base64
-from adversarial_noise import AdversarialNoiseGenerator
+from core.adversarial_noise import AdversarialNoiseGenerator
 
 
 class ImageProcessor:
-    def __init__(self):
+    def __init__(self, privacy_detector: PrivacyDetector, grounding_sam: GroundingDINO_SAMModel):
         self.device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-        self.privacy_detector = PrivacyDetector(use_gpu=self.device != "cpu")
-        self.object_detector = GroundingDINO_SAMModel(device=self.device)
+        self.privacy_detector = privacy_detector
+        self.object_detector = grounding_sam
         self.adversarial_noise_generator = AdversarialNoiseGenerator()
     
     def to_png_b64(self, img: np.ndarray) -> str:
