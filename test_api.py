@@ -17,6 +17,7 @@ import mimetypes
 import os
 import time
 from typing import Dict, Optional
+from xml.etree.ElementTree import TreeBuilder
 
 import requests
 
@@ -137,6 +138,7 @@ def test_batch(base_url: str, paths: list[str], timeout: float = 30.0) -> None:
                 continue
             f = open(p, "rb")
             to_close.append(f)
+            print("REACHED")
             files.append(("files", (os.path.basename(p), f, detect_mime(p))))
 
         if not files:
@@ -200,15 +202,23 @@ def main():
         pass
 
     # 2) Upload(s)
-    if args.batch and len(args.files) >= 1:
-        test_batch(args.base_url, args.files)
+    input_files = ["IMG.png", "bedroom.mp4"]
+    is_batch = True
+    if is_batch and len(input_files) >= 1:
+        test_batch(args.base_url, input_files)
     else:
-        targets = args.files or ["IMG.png"]  # default demo file
+        targets = args.files or ["bedroom.mp4"]  # default demo file
         for idx, path in enumerate(targets, start=2):
             print(f"\n{idx}. Upload test")
             test_single_file(args.base_url, path)
             # respect user-configured wait per job (poller uses its own default unless you tweak it)
 
+    # 3) poll a job
+    # print("\n2. Polling a sample job...")
+    # job_id = "a43b1d9d-7987-4266-92ae-4a9f560149bf"
+    # result = poll_job(args.base_url, job_id)
+    # print("   🎯 Final job payload:")
+    # print(json.dumps(result, indent=2, ensure_ascii=False))
 
     print("\n🎯 API Testing Complete!")
     print("📱 Mobile app can connect to: http://YOUR_LAPTOP_IP:8000/api/")

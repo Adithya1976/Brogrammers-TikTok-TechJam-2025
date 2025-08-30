@@ -6,6 +6,7 @@ from PIL import Image
 import numpy as np
 import cv2
 import base64
+from adversarial_noise import AdversarialNoiseGenerator
 
 
 class ImageProcessor:
@@ -13,7 +14,7 @@ class ImageProcessor:
         self.device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         self.privacy_detector = PrivacyDetector(use_gpu=self.device != "cpu")
         self.object_detector = GroundingDINO_SAMModel(device=self.device)
-        print(f"Using device: {self.device}")
+        self.adversarial_noise_generator = AdversarialNoiseGenerator()
     
     def to_png_b64(self, img: np.ndarray) -> str:
         # For masks: convert bool -> uint8 (0/255). You can also try 1-bit PNG (see note below).
@@ -53,7 +54,13 @@ class ImageProcessor:
 
         # step 3: adversarial networks
         # placeholder
-        noise_induced_image = image
+        # noise_induced_image = image
+        noise_induced_image = self.adversarial_noise_generator.apply_pgd_attack(
+             image=image,
+             epsilon=0.007,
+             iterations=20,
+             target_coords=(85.8, -176.15) # Example: Target the Arctic Ocean
+        )
 
         result = {
             "processed_image": self.to_png_b64(np.array(noise_induced_image)),
@@ -62,8 +69,3 @@ class ImageProcessor:
         }
         
         return result
-
-
-
-
-

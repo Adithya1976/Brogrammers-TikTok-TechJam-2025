@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any
 
 from core.image_processor import ImageProcessor
+from core.object_detector import GroundingDINO_SAMModel
 from core.privacy_detector import PrivacyDetector
 from core.video_processor import VideoProcessor
 from core.adversarial_noise import AdversarialNoiseGenerator
@@ -42,8 +43,10 @@ app.add_middleware(
 # -------------------------
 # Globals
 # -------------------------
-image_processor = ImageProcessor()
-video_processor = VideoProcessor()
+grounding_sam = GroundingDINO_SAMModel()
+privacy_detector = PrivacyDetector()
+image_processor = ImageProcessor(grounding_sam=grounding_sam, privacy_detector=privacy_detector)
+video_processor = VideoProcessor(grounding_sam=grounding_sam, privacy_detector=privacy_detector)
 storage = ProcessingResult()
 
 JOBS_DIR = "./jobs"
@@ -132,13 +135,13 @@ async def _process_single_file_job(job_id: str, stored_path: str, content_type: 
     t0 = time.time()
     try:
         _update_job(job_id, status="running")
-        with open(stored_path, "rb") as f:
-            content = f.read()
 
         if content_type.startswith("image/"):
+            with open(stored_path, "rb") as f:
+                content = f.read()
             result = await asyncio.to_thread(image_processor.process_image, content)
         elif content_type.startswith("video/"):
-            result = await asyncio.to_thread(video_processor.process_video, content)
+            result = await asyncio.to_thread(video_processor.process_video, stored_path)
         else:
             raise ValueError(f"Unsupported file type: {content_type}")
 
@@ -158,41 +161,55 @@ async def _process_batch_job(job_id: str, entries: List[Dict[str, str]]):
     t0 = time.time()
     aggregated: List[Dict[str, Any]] = []
     try:
+        # Match single-file job: mark as running (and include initial progress)
         _update_job(job_id, status="running", result={"processed": 0, "results": []})
 
         for idx, ent in enumerate(entries, start=1):
-            per_file: Dict[str, Any] = {"filename": ent["filename"], "file_type": "image" if ent["content_type"].startswith("image/") else "video"}
+            per_file: Dict[str, Any] = {
+                "filename": ent["filename"],
+                "file_type": "image" if ent["content_type"].startswith("image/") else "video"
+            }
+
             try:
-                with open(ent["path"], "rb") as f:
-                    content = f.read()
                 if ent["content_type"].startswith("image/"):
-                    res = privacy_detector.process_image(content, ent["filename"])
+                    # Images: read bytes and offload to thread (same as single-file)
+                    with open(ent["path"], "rb") as f:
+                        content = f.read()
+                    res = await asyncio.to_thread(image_processor.process_image, content)
+
                 elif ent["content_type"].startswith("video/"):
-                    res = video_processor.process_video(content)
+                    # Videos: pass the PATH to the processor (same as single-file)
+                    res = await asyncio.to_thread(video_processor.process_video, ent["path"])
+
                 else:
                     raise ValueError(f"Unsupported file type: {ent['content_type']}")
 
-                # (Optional) integrate your existing storage.save_result if you want persistent IDs
-                # result_id = storage.save_result(ent["filename"], res)
-                # res["result_id"] = result_id
-
                 per_file.update({"success": True, "result": res})
+
             except Exception as e:
                 performance_monitor.record_error()
+                traceback.print_exc()
                 per_file.update({"success": False, "error": str(e)})
 
             aggregated.append(per_file)
-            # stream progress to the job json
+
+            # Stream progress after each file
             _update_job(job_id, result={"processed": idx, "results": aggregated})
 
         processing_time = time.time() - t0
         performance_monitor.record_processing_time(processing_time)
-        _update_job(job_id, status="done", error=None, result={"processed": len(aggregated), "results": aggregated})
+
+        _update_job(
+            job_id,
+            status="done",
+            error=None,
+            result={"processed": len(aggregated), "results": aggregated},
+        )
+
     except Exception as e:
         performance_monitor.record_error()
         traceback.print_exc()
         _update_job(job_id, status="error", error=str(e))
-
 # -------------------------
 # Endpoints
 # -------------------------
@@ -249,7 +266,7 @@ async def process_batch(bg: BackgroundTasks, files: List[UploadFile] = File(...)
         })
 
         # fire
-        bg.add_task(_process_batch_job, job_id, entries)
+        asyncio.create_task(_process_batch_job(job_id, entries))
 
         return JSONResponse(
             status_code=202,
@@ -287,7 +304,7 @@ async def health_check():
 if __name__ == "__main__":
     uvicorn.run(
         app,
-        host="0.0.0.0",
+        host="localhost", # Prefer localhost over 0.0.0.0
         port=8000,
         workers=1,  # single worker keeps GPU libs simple; scale with a real queue later
     )

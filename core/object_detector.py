@@ -33,6 +33,7 @@ class DetectionResult:
     label: str
     box: BoundingBox
     mask: Optional[np.ndarray] = None
+    type: str = "visual"  # 'visual' or 'text'
 
     @classmethod
     def from_dict(cls, detection_dict: Dict) -> 'DetectionResult':
@@ -69,7 +70,7 @@ class GroundingDINO_SAMModel:
         # Set default labels for detection (if none are provided)
         self.default_labels = ["person", "license plate", "card", "sign"]
 
-    def detect(self, image: Image.Image, labels: List[str] = [], score_threshold: float = 0.25) -> List[DetectionResult]:
+    def detect(self, image: Image.Image, labels: List[str] = [], score_threshold: float = 0.4) -> List[DetectionResult]:
         """
         Runs Grounding DINO on the given image.
 
