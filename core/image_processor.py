@@ -16,9 +16,10 @@ class ImageProcessor:
         self.object_detector = grounding_sam
         self.adversarial_noise_generator = AdversarialNoiseGenerator()
     
-    def to_png_b64(self, img: np.ndarray) -> str:
+    def to_png_b64(self, img: np.ndarray, is_mask=False) -> str:
         # For masks: convert bool -> uint8 (0/255). You can also try 1-bit PNG (see note below).
-        img = (img.astype(np.uint8) * 255)
+        if is_mask:
+            img = (img.astype(np.uint8) * 255)
         ok, buf = cv2.imencode(".png", img)
         if not ok:
             raise RuntimeError("PNG encode failed")
@@ -49,7 +50,7 @@ class ImageProcessor:
         entities = object_detection_entities + privacy_detection_results
         entities = [{
             "entity_name": e["entity_name"],
-            "mask": self.to_png_b64(e["mask"]),
+            "mask": self.to_png_b64(e["mask"], is_mask=True),
         } for e in entities]
 
         # step 3: adversarial networks
