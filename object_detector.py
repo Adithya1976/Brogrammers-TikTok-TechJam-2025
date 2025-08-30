@@ -22,6 +22,9 @@ class BoundingBox:
     @property
     def xyxy(self) -> List[float]:
         return [self.xmin, self.ymin, self.xmax, self.ymax]
+    
+    def to_dict(self) -> Dict[str, float]:
+        return {"xmin": self.xmin, "ymin": self.ymin, "xmax": self.xmax, "ymax": self.ymax}
 
 
 @dataclass
@@ -158,30 +161,6 @@ class GroundingSAM:
             return []
         return [result.box for result in detections]
 
-    def __get_masks(self, detections: List[DetectionResult]) -> List[np.ndarray]:
-        """
-        Returns the masks of the detected objects.
-        """
-        if detections is None:
-            return []
-        return [result.mask for result in detections if result.mask is not None]
-
-    def __get_labels(self, detections: List[DetectionResult]) -> List[str]:
-        """
-        Returns the labels of the detected objects.
-        """
-        if detections is None:
-            return []
-        return [result.label for result in detections]
-
-    def __get_scores(self, detections: List[DetectionResult]) -> List[float]:
-        """
-        Returns the scores of the detected objects.
-        """
-        if detections is None:
-            return []
-        return [result.score for result in detections]
-
     def draw_on_image(self, image: Image.Image, detections: List[DetectionResult]) -> Image.Image:
         """
         Draws the bounding boxes and masks on the image.
@@ -240,8 +219,8 @@ class GroundingSAM:
 
     def process_image(self, image: Image.Image, labels: List[str], score_threshold: float = 0.25) -> Dict[str, Any]:
         """
-        Runs the full detection and segmentation pipeline on a single image and
-        returns the aggregated masks for each entity type in a structured format.
+        Runs the full pipeline on a single image and returns a list of all
+        individual detected entities with their own masks.
 
         Args:
             image (Image.Image): The input image to process.
@@ -249,100 +228,40 @@ class GroundingSAM:
             score_threshold (float): The confidence threshold for object detection.
 
         Returns:
-            A dictionary containing the image shape and a list of entities,
-            where each entity has a name and a combined binary mask.
+            A dictionary containing the image shape and a list of individual entities.
         """
         width, height = image.size
-        if not labels:
-            labels = self.default_labels
 
-        # 1. Detect objects in the image
+        # 1. Detect all object instances
         detections = self.detect(image, labels, score_threshold)
         if not detections:
             logging.info("No objects detected.")
             return {"shape": (width, height), "entities": []}
 
-        # 2. Segment the detected objects
+        # 2. Segment each instance to get its individual mask
         segmented_detections = self.segment(image, detections)
         if not segmented_detections:
-            # This case is unlikely if detections were found, but good practice
             return {"shape": (width, height), "entities": []}
 
-        # 3. Aggregate masks by entity label
-        # We create one combined mask for all instances of the same label.
-        aggregated_masks: Dict[str, np.ndarray] = {}
-        for detection in segmented_detections:
+        # 3. Format the final output, preserving each entity
+        output_entities = []
+        for i, detection in enumerate(segmented_detections):
+            # Ensure the detection has a mask
             if detection.mask is None:
                 continue
-            
-            # If this is the first time we see this label, initialize its mask
-            if detection.label not in aggregated_masks:
-                aggregated_masks[detection.label] = np.zeros((height, width), dtype=np.uint8)
 
-            # Add the current detection's mask to the aggregated mask for its label
-            # We use np.maximum to perform a logical OR operation on the masks
-            aggregated_masks[detection.label] = np.maximum(
-                aggregated_masks[detection.label], 
-                detection.mask
-            )
-
-        # 4. Format the final output
-        output_entities = []
-        for entity_name, mask_array in aggregated_masks.items():
             output_entities.append({
-                "entity_name": entity_name,
-                "mask": mask_array # This is a (height, width) numpy array
+                "entity_id": i,  # A simple unique ID for this image
+                "label": detection.label,
+                "score": round(detection.score, 2),
+                "box": detection.box.to_dict(), # Use the new helper method
+                "mask": detection.mask # The individual (height, width) numpy array
             })
 
         return {
             "shape": (width, height),
             "entities": output_entities
         }
-
-
-# TODO: Check if this is needed
-def blur_objects_in_image(image: Image.Image, detections: List[DetectionResult] | None, radius: int = 25) -> Image.Image:
-    """
-    Blurs the objects in the image based on the detected masks.
-
-    Args:
-        radius (int): The radius of the blur effect.
-
-    Returns:
-        The final image with blurred objects.
-    """
-    # 1. Create a fully blurred version of the original image
-    blurred_image = image.filter(ImageFilter.GaussianBlur(radius=radius))
-
-    # 2. Create a combined mask for all detected objects
-    combined_mask_np = np.zeros(np.array(image).shape[:2], dtype=np.uint8)
-
-    if not detections:
-        return image
-
-    for detection in detections:
-        if detection.mask is None:
-            continue
-        mask = np.asarray(detection.mask)
-        # Collapse accidental channel dimension if present
-        if mask.ndim == 3:
-            h, w = image.height, image.width
-            if mask.shape == (h, w, mask.shape[2]):
-                mask = mask.max(axis=-1)
-            elif mask.shape == (mask.shape[0], h, w):
-                mask = mask.max(axis=0)
-            else:
-                mask = mask.max(axis=0)
-        mask = (mask > 0).astype(np.uint8)
-        combined_mask_np = np.maximum(combined_mask_np, mask)
-
-    # 3. Convert the combined NumPy mask back to a PIL Image (scale to 0-255)
-    combined_mask_pil = Image.fromarray((combined_mask_np * 255).astype(np.uint8), mode='L')
-
-    # 4. Composite the blurred image onto the original using the combined mask
-    final_image = Image.composite(blurred_image, image, combined_mask_pil)
-
-    return final_image
 
 
 # Example Workflow
@@ -394,7 +313,7 @@ if __name__ == "__main__":
             mask_image = Image.fromarray(colored_mask, 'RGB')
             
             # Blend the mask with the original image
-            visual_image = Image.blend(visual_image, mask_image, alpha=0.25)
+            visual_image = Image.blend(visual_image, mask_image, alpha=0.1)
 
         visual_image.show(title="Aggregated Masks Visualization")
 
