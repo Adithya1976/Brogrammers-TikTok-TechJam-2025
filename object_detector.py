@@ -1,9 +1,15 @@
 from dataclasses import dataclass
+from pprint import pprint
 from transformers import AutoProcessor, AutoModelForMaskGeneration, pipeline
 from PIL import Image, ImageDraw, ImageOps, ImageFilter
 import torch
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import numpy as np
+import logging
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
 @dataclass
@@ -45,8 +51,8 @@ class GroundingSAM:
             self.device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
         else:
             self.device = device
-        
-        print(f"Initializing GroundingSAM on device: {self.device}")
+
+        logging.info(f"Initializing GroundingSAM on device: {self.device}")
 
         # --- Use fast model names ---
         dino_model_name = "IDEA-Research/grounding-dino-tiny"
@@ -56,6 +62,9 @@ class GroundingSAM:
         self.object_detector = pipeline(model=dino_model_name, task="zero-shot-object-detection", device=self.device)
         self.sam_processor = AutoProcessor.from_pretrained(sam_model_name)
         self.sam_model = AutoModelForMaskGeneration.from_pretrained(sam_model_name).to(self.device)
+
+        # Set default labels for detection (if none are provided)
+        self.default_labels = ["person", "license plate", "card", "sign"]
 
     def detect(self, image: Image.Image, labels: List[str], score_threshold: float = 0.25) -> List[DetectionResult]:
         """
@@ -69,6 +78,9 @@ class GroundingSAM:
         Returns:
             A list of DetectionResult objects.
         """
+        if not labels:
+            labels = self.default_labels
+
         # Ensure labels end with a dot for better performance
         processed_labels = [label if label.endswith(".") else label + "." for label in labels]
         
@@ -90,7 +102,7 @@ class GroundingSAM:
             The detection list with masks updated.
         """
         if not detections:
-            print("Warning: segment() called without any prior detections.")
+            logging.warning("Warning: segment() called without any prior detections.")
             return None
         
         input_boxes = [[box.xyxy for box in self.__get_boxes(detections)]]
@@ -226,6 +238,67 @@ class GroundingSAM:
 
         return final_image
 
+    def process_image(self, image: Image.Image, labels: List[str], score_threshold: float = 0.25) -> Dict[str, Any]:
+        """
+        Runs the full detection and segmentation pipeline on a single image and
+        returns the aggregated masks for each entity type in a structured format.
+
+        Args:
+            image (Image.Image): The input image to process.
+            labels (List[str]): The list of entity names to detect.
+            score_threshold (float): The confidence threshold for object detection.
+
+        Returns:
+            A dictionary containing the image shape and a list of entities,
+            where each entity has a name and a combined binary mask.
+        """
+        width, height = image.size
+        if not labels:
+            labels = self.default_labels
+
+        # 1. Detect objects in the image
+        detections = self.detect(image, labels, score_threshold)
+        if not detections:
+            logging.info("No objects detected.")
+            return {"shape": (width, height), "entities": []}
+
+        # 2. Segment the detected objects
+        segmented_detections = self.segment(image, detections)
+        if not segmented_detections:
+            # This case is unlikely if detections were found, but good practice
+            return {"shape": (width, height), "entities": []}
+
+        # 3. Aggregate masks by entity label
+        # We create one combined mask for all instances of the same label.
+        aggregated_masks: Dict[str, np.ndarray] = {}
+        for detection in segmented_detections:
+            if detection.mask is None:
+                continue
+            
+            # If this is the first time we see this label, initialize its mask
+            if detection.label not in aggregated_masks:
+                aggregated_masks[detection.label] = np.zeros((height, width), dtype=np.uint8)
+
+            # Add the current detection's mask to the aggregated mask for its label
+            # We use np.maximum to perform a logical OR operation on the masks
+            aggregated_masks[detection.label] = np.maximum(
+                aggregated_masks[detection.label], 
+                detection.mask
+            )
+
+        # 4. Format the final output
+        output_entities = []
+        for entity_name, mask_array in aggregated_masks.items():
+            output_entities.append({
+                "entity_name": entity_name,
+                "mask": mask_array # This is a (height, width) numpy array
+            })
+
+        return {
+            "shape": (width, height),
+            "entities": output_entities
+        }
+
 
 # TODO: Check if this is needed
 def blur_objects_in_image(image: Image.Image, detections: List[DetectionResult] | None, radius: int = 25) -> Image.Image:
@@ -277,35 +350,85 @@ if __name__ == "__main__":
     # Ensure your dataclasses and detect/draw_on_image functions are defined
     
     image_path = '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/number plates/mercedes_number_plate.png'
-    input_labels = ["person", "license plate", "sign"]
 
-    image = Image.open(image_path).convert("RGB")
-    image = ImageOps.exif_transpose(image)  # handle exif orientation
+    try:
+        image = Image.open(image_path).convert("RGB")
+        image = ImageOps.exif_transpose(image)
+    except FileNotFoundError:
+        logging.error(f"Error: Image file not found at {image_path}. Please update the path.")
+        exit()
 
-    groundingSAM = GroundingSAM()
+    # --- Define labels to search for ---
+    input_labels = ["person", "license plate", "chair"]
 
-    # 1. Detect objects with GroundingDINO
-    print("Step 1: Detecting objects...")
-    detections = groundingSAM.detect(image=image, labels=input_labels, score_threshold=0.3)
+    # --- Initialize the pipeline ONCE ---
+    print("Initializing GroundingSAM pipeline...")
+    g_sam = GroundingSAM()
 
-    if not detections:
-        print("No objects detected. Exiting.")
-    else:
-        for detection in detections:
-            print(detection)
+    # --- Process the image ---
+    print(f"\nProcessing image for labels: {input_labels}")
+    processed_data = g_sam.process_image(image=image, labels=input_labels)
 
-        # Draw original bounding boxes for comparison
-        bbox_image = groundingSAM.draw_on_image(image, detections)
-        print("Showing image with original bounding boxes...")
-        bbox_image.show()
+    # --- Print the structured output ---
+    print("\n--- Structured Output ---")
+    # Using pprint for readable dictionary printing
+    pprint(processed_data)
 
-        # 2. Segment the detected objects with SAM
-        print("\nStep 2: Segmenting detected objects...")
-        segmented_detections = groundingSAM.segment(image=image, detections=detections)
+    # --- (Optional) Visualize the aggregated masks ---
+    if processed_data['entities']:
+        print("\nVisualizing aggregated masks...")
+        # Create a copy of the image to draw on
+        visual_image = image.copy()
+        
+        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)] # Red, Green, Blue, Yellow
 
-        # 3. Apply the blur effect using the generated masks
-        print("\nStep 3: Applying blur effect...")
-        blurred_image = blur_objects_in_image(image, segmented_detections)
+        for i, entity in enumerate(processed_data['entities']):
+            mask_np = entity['mask']
+            color = colors[i % len(colors)]
+            
+            # Create a colored mask image: shape (H, W, 3)
+            colored_mask = np.zeros((*mask_np.shape, 3), dtype=np.uint8)
+            colored_mask[mask_np == 1] = color
+            
+            # Convert to PIL Image for blending
+            mask_image = Image.fromarray(colored_mask, 'RGB')
+            
+            # Blend the mask with the original image
+            visual_image = Image.blend(visual_image, mask_image, alpha=0.25)
 
-        print("Showing final image with blurred objects...")
-        blurred_image.show()
+        visual_image.show(title="Aggregated Masks Visualization")
+
+    ## Another Example
+
+    # input_labels = ["person", "license plate", "sign"]
+
+    # image = Image.open(image_path).convert("RGB")
+    # image = ImageOps.exif_transpose(image)  # handle exif orientation
+
+    # groundingSAM = GroundingSAM()
+
+    # # 1. Detect objects with GroundingDINO
+    # print("Step 1: Detecting objects...")
+    # detections = groundingSAM.detect(image=image, labels=input_labels, score_threshold=0.3)
+
+    # if not detections:
+    #     print("No objects detected. Exiting.")
+    # else:
+    #     for detection in detections:
+    #         print(detection)
+
+    #     # Draw original bounding boxes for comparison
+    #     bbox_image = groundingSAM.draw_on_image(image, detections)
+    #     print("Showing image with original bounding boxes...")
+    #     bbox_image.show()
+
+    #     # 2. Segment the detected objects with SAM
+    #     print("\nStep 2: Segmenting detected objects...")
+    #     segmented_detections = groundingSAM.segment(image=image, detections=detections)
+
+    #     # 3. Apply the blur effect using the generated masks
+    #     print("\nStep 3: Applying blur effect...")
+    #     blurred_image = blur_objects_in_image(image, segmented_detections)
+
+    #     print("Showing final image with blurred objects...")
+    #     blurred_image.show()
