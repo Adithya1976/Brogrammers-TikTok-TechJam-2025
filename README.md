@@ -1,6 +1,6 @@
 # TasksAI Privacy Pipeline
 
-[Youtube Video Link]()
+[Youtube Video Link](https://www.youtube.com/watch?v=xHC2i59YnKc)
 
 ## Project Overview
 
