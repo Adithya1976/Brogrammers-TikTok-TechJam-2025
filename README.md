@@ -1,6 +1,11 @@
 # TasksAI Privacy Pipeline
 
-A 72-hour hackathon project for detecting and protecting privacy-sensitive information in images and videos using OCR and AI.
+[Youtube Video Link]()
+
+## Project Overview
+
+A 72-hour hackathon project for developing a privacy-focussed photo gallery app with the following capabilities:
+
 
 ## Features
 
@@ -14,71 +19,37 @@ A 72-hour hackathon project for detecting and protecting privacy-sensitive infor
 
 1. **Setup**:
    ```bash
-   python setup.py
+   pip install -r requirements.txt
    ```
 
 2. **Run**:
+   First run the server:
    ```bash
    python main.py
    ```
 
-3. **Open**: http://localhost:8000
+   Wait until you see the log message "Uvicorn running at http://127.0.0.1:8000" in your terminal, indicating the server has started.
+   
+   Once this appears, all functionalities of the app will be available.
 
-## API Endpoints
+   Alternatively, use/modify the template at test_api.py.
 
-- `POST /process` - Analyze image/video for privacy concerns
-- `POST /add-noise` - Add adversarial noise to image
-- `POST /blur-sensitive` - Blur sensitive regions in image
 
 ## Tech Stack
 
 - **Backend**: FastAPI, Python
-- **OCR**: Tesseract
-- **Privacy Detection**: Microsoft Presidio
-- **Image Processing**: OpenCV, PIL
-- **Video Processing**: OpenCV
+- **OCR**: [Tesseract](https://github.com/tesseract-ocr/tesseract)
+- **Privacy Detection**: [Microsoft Presidio](https://microsoft.github.io/presidio/)
+- **Image Processing**: [GroundingSAM](https://huggingface.co/docs/transformers/v4.44.2/model_doc/grounding-dino#grounded-sam)
+- **Audio Processing**: [OpenAI Whisper](https://github.com/openai/whisper)
+- **Adversarial Noise Generator**: [GeoClip](https://arxiv.org/abs/2309.16020)
 
-## Hackathon Roadmap
-
-### Day 1 (MVP)
-- [x] Basic FastAPI setup
-- [x] OCR integration
-- [x] Presidio privacy detection
-- [x] Simple web interface
-
-### Day 2 (Core Features)
-- [x] Video processing pipeline
-- [x] Adversarial noise generation
-- [x] Image blurring capabilities
-- [ ] Database for storing results
-- [ ] Improved UI/UX
-
-### Day 3 (Polish & Extensions)
-- [ ] Mobile-responsive design
-- [ ] Batch processing
-- [ ] Performance optimization
-- [ ] Demo video creation
-- [ ] Presentation preparation
 
 ## Privacy Entities Detected
 
-- PERSON (names)
+- PERSON
 - EMAIL_ADDRESS
 - PHONE_NUMBER
 - CREDIT_CARD
 - SSN (Social Security Numbers)
-- And more via Presidio
-
-## Installation Notes
-
-**Tesseract OCR** is required:
-- Windows: Download from [UB-Mannheim](https://github.com/UB-Mannheim/tesseract/wiki)
-- macOS: `brew install tesseract`
-- Ubuntu: `sudo apt install tesseract-ocr`
-
-## Demo Ideas
-
-1. Upload ID card → Shows privacy score + blurred version
-2. Upload screenshot with email → Detects email, adds noise
-3. Upload video → Processes frames, flags sensitive content
-4. Show before/after adversarial noise effectiveness
+- LICENSE_PLATES

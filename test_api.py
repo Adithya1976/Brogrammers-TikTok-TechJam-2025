@@ -3,32 +3,34 @@
 Test the TasksAI Privacy Pipeline API (matches 202 + job polling behavior).
 
 Usage:
-  python test_api.py --base http://localhost:8000 IMG_8414.JPG
-  python test_api.py --base http://localhost:8000 --batch sample1.jpg sample2.jpg
+  # Process a single file with a 20-minute timeout
+  python test_api.py --wait 1200 my_video.MOV
 
-Notes:
-- /process returns 202 + {"job_id", "status_url"} and we poll /jobs/{job_id}
-- /api/health is used to verify server status
-- Batch mode hits /api/process-batch and polls the same /jobs/{job_id}
+  # Process multiple files as a single batch job
+  python test_api.py --batch file1.jpg file2.MOV
 """
 import argparse
+import base64
 import json
 import mimetypes
 import os
 import time
 from typing import Dict, Optional
-from xml.etree.ElementTree import TreeBuilder
 
+import cv2
+import numpy as np
 import requests
 
 
 def join_url(base: str, path: str) -> str:
+    """Construct a full URL from a base and a path."""
     base = base.rstrip("/")
     path = path if path.startswith("/") else f"/{path}"
     return f"{base}{path}"
 
 
 def get_health(base_url: str, timeout: float = 5.0) -> Optional[Dict]:
+    """Check the health of the API."""
     try:
         r = requests.get(join_url(base_url, "/api/health"), timeout=timeout)
         if r.status_code == 200:
@@ -46,13 +48,13 @@ def get_health(base_url: str, timeout: float = 5.0) -> Optional[Dict]:
 
 
 def detect_mime(path: str) -> str:
+    """Detect the MIME type of a file."""
     mt, _ = mimetypes.guess_type(path)
-    # default to image/jpeg if unknown; FastAPI will still use filename
     return mt or "application/octet-stream"
 
 
 def poll_job(base_url: str, job_id: str, max_wait: float = 180.0, tick: float = 1.0) -> Dict:
-    """Poll /jobs/{job_id} until status in {'done','error'} or timeout."""
+    """Poll a job until it's done or an error occurs."""
     url = join_url(base_url, f"/jobs/{job_id}")
     start = time.time()
     last_status = None
@@ -72,7 +74,81 @@ def poll_job(base_url: str, job_id: str, max_wait: float = 180.0, tick: float = 
         time.sleep(tick)
 
 
-def test_single_file(base_url: str, path: str, timeout: float = 10.0):
+def overlay_video_masks(video_path: str, result_data: dict) -> None:
+    """
+    Overlay masks from the API result onto the original video and save a new file.
+    """
+    print(f"\n🎬 Processing video masks for {video_path}...")
+    entities = result_data.get("entities")
+    shape = result_data.get("shape")
+
+    if not shape or len(shape) not in [2, 3]:
+        print(f"   ❌ Invalid 'shape' in result for video processing. Expected 2 or 3 elements, but got: {shape}")
+        return
+
+    original_width, original_height = shape[:2]
+
+    if not entities:
+        print("   ⚠️ No entities with masks found in the result.")
+        return
+
+    video_capture = cv2.VideoCapture(video_path)
+    if not video_capture.isOpened():
+        print(f"   ❌ Error opening video file: {video_path}")
+        return
+
+    fps = video_capture.get(cv2.CAP_PROP_FPS)
+    fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+    output_filename = f"{os.path.splitext(video_path)[0]}_processed.mp4"
+    video_writer = cv2.VideoWriter(output_filename, fourcc, fps, (original_width, original_height))
+
+    try:
+        # Create a blank composite mask that will be applied to all frames.
+        # This approach simplifies the demo by creating one static mask for the whole video.
+        combined_mask_for_video = np.zeros((original_height, original_width), dtype=np.uint8)
+        for entity in entities:
+            mask_b64 = entity.get("mask_video")
+            if mask_b64:
+                mask_bytes = base64.b64decode(mask_b64)
+                # Reshape the decoded bytes into the multi-frame mask array
+                mask_array = np.frombuffer(mask_bytes, dtype=np.uint8).reshape(-1, original_height, original_width)
+                # Combine all masks for this entity across all frames into one static mask
+                static_entity_mask = np.any(mask_array, axis=0).astype(np.uint8)
+                # Add this entity's static mask to the main composite mask
+                np.bitwise_or(combined_mask_for_video, static_entity_mask, out=combined_mask_for_video)
+
+        combined_mask_bool = combined_mask_for_video > 0
+
+    except Exception as e:
+        print(f"   ❌ Failed to decode or process masks: {e}")
+        video_capture.release()
+        video_writer.release()
+        import traceback
+        traceback.print_exc()
+        return
+
+    print(f"   ✅ Decoded masks. Now applying to video frames...")
+    frame_count = 0
+    while True:
+        ret, frame = video_capture.read()
+        if not ret:
+            break
+
+        # Apply the combined static mask to every frame
+        frame[combined_mask_bool] = [0, 0, 0]  # Set masked area to black
+
+        video_writer.write(frame)
+        frame_count += 1
+
+    print(f"   ✅ Processed {frame_count} frames.")
+    print(f"   💾 Saved processed video to: {output_filename}")
+
+    video_capture.release()
+    video_writer.release()
+
+
+def test_single_file(base_url: str, path: str, timeout: float = 10.0, max_wait: float = 180.0) -> None:
+    """Test processing for a single file."""
     if not os.path.exists(path):
         print(f"   ⚠️  {path} not found")
         return
@@ -83,51 +159,38 @@ def test_single_file(base_url: str, path: str, timeout: float = 10.0):
         files = {"file": (os.path.basename(path), f, ctype)}
         r = requests.post(join_url(base_url, "/process"), files=files, timeout=timeout)
 
-    # Expect 202 with job id
     if r.status_code == 202:
         try:
             data = r.json()
         except Exception:
-            print("   ❌ Invalid JSON in 202 response")
-            print(f"   Body: {r.text}")
-            return None
+            print(f"   ❌ Invalid JSON in 202 response. Body: {r.text}")
+            return
 
         job_id = data.get("job_id")
-        status_url = data.get("status_url")
-        loc_header = r.headers.get("Location")
         print(f"   ✅ Enqueued (job_id={job_id})")
-        if status_url:
-            print(f"   📍 Status URL (body): {status_url}")
-        if loc_header:
-            print(f"   📍 Status URL (Location header): {loc_header}")
 
         if not job_id:
             print("   ❌ Missing job_id in response; cannot poll.")
-            return None
+            return
 
-        # Poll
-        result = poll_job(base_url, job_id)
+        result = poll_job(base_url, job_id, max_wait=max_wait)
         print("   🎯 Final job payload:")
         print(json.dumps(result, indent=2, ensure_ascii=False))
-        return result
 
-    # Back-compat: some servers might return 200 with immediate result
+        # --- VIDEO POST-PROCESSING HOOK ---
+        if result.get("status") == "done" and ctype.startswith("video/"):
+            overlay_video_masks(path, result.get("result", {}))
+        return
+
     if r.status_code == 200:
-        print("   ⚠️ Received 200 OK (immediate result). Body:")
-        try:
-            print(json.dumps(r.json(), indent=2, ensure_ascii=False))
-        except Exception:
-            print(r.text)
-        return None
+        print(f"   ⚠️ Received 200 OK (immediate result). Body: {r.text}")
+        return
 
-    print(f"   ❌ Upload failed: HTTP {r.status_code}")
-    try:
-        print(f"   Body: {r.text}")
-    except Exception:
-        return None
+    print(f"   ❌ Upload failed: HTTP {r.status_code}. Body: {r.text}")
 
 
-def test_batch(base_url: str, paths: list[str], timeout: float = 30.0) -> None:
+def test_batch(base_url: str, paths: list[str], timeout: float = 30.0, max_wait: float = 600.0) -> None:
+    """Test processing for a batch of files."""
     print(f"\n▶️  Testing batch upload: {len(paths)} files")
     files = []
     to_close = []
@@ -138,7 +201,6 @@ def test_batch(base_url: str, paths: list[str], timeout: float = 30.0) -> None:
                 continue
             f = open(p, "rb")
             to_close.append(f)
-            print("REACHED")
             files.append(("files", (os.path.basename(p), f, detect_mime(p))))
 
         if not files:
@@ -148,8 +210,7 @@ def test_batch(base_url: str, paths: list[str], timeout: float = 30.0) -> None:
         r = requests.post(join_url(base_url, "/api/process-batch"), files=files, timeout=timeout)
 
         if r.status_code != 202:
-            print(f"   ❌ Batch enqueue failed: HTTP {r.status_code}")
-            print(f"   Body: {r.text}")
+            print(f"   ❌ Batch enqueue failed: HTTP {r.status_code}. Body: {r.text}")
             return
 
         data = r.json()
@@ -159,9 +220,19 @@ def test_batch(base_url: str, paths: list[str], timeout: float = 30.0) -> None:
             print("   ❌ Missing job_id in batch response; cannot poll.")
             return
 
-        result = poll_job(base_url, job_id, max_wait=600.0)  # batches can take longer
+        result = poll_job(base_url, job_id, max_wait=max_wait)
         print("   🎯 Final batch job payload:")
         print(json.dumps(result, indent=2, ensure_ascii=False))
+
+        # --- VIDEO POST-PROCESSING HOOK FOR BATCH ---
+        if result.get("status") == "done":
+            video_files_in_batch = [p for p in paths if detect_mime(p).startswith("video/")]
+            if video_files_in_batch:
+                print(f"\n🎬 Batch job complete. Applying results to video files...")
+                # This assumes the result payload can be applied to each video.
+                # A more complex API might return results per file.
+                for video_path in video_files_in_batch:
+                    overlay_video_masks(video_path, result.get("result", {}))
 
     finally:
         for f in to_close:
@@ -172,75 +243,32 @@ def test_batch(base_url: str, paths: list[str], timeout: float = 30.0) -> None:
 
 
 def main():
+    """Main function to parse arguments and run tests."""
     parser = argparse.ArgumentParser(description="Test TasksAI Privacy Pipeline API")
-    parser.add_argument(
-        "--base", dest="base_url", default="http://localhost:8000", help="Base URL of the API"
-    )
-    parser.add_argument(
-        "--batch", action="store_true", help="Send all provided files as a single batch job"
-    )
-    parser.add_argument(
-        "--wait", type=float, default=180.0, help="Max seconds to wait for single job"
-    )
-    parser.add_argument("files", nargs="*", help="Image/video files to upload")
+    parser.add_argument("--base", dest="base_url", default="http://localhost:8000", help="Base URL of the API")
+    parser.add_argument("--batch", action="store_true", help="Send all provided files as a single batch job")
+    parser.add_argument("--wait", type=float, default=180.0, help="Max seconds to wait for a job")
+    parser.add_argument("files", nargs="+", help="Image/video files to upload")
     args = parser.parse_args()
 
     print("🧪 Testing TasksAI Privacy Pipeline API")
     print("=" * 40)
 
-    # 1) Health
     print("1. Testing health check...")
-    health = get_health(args.base_url)
-    if not health:
+    if not get_health(args.base_url):
         return
-    try:
-        print(f"   ✅ Server: {health.get('server', 'unknown')} (v{health.get('version','?')})")
-        gpu_name = health.get("gpu_name") or health.get("gpu") or health.get("gpu_model")
-        if gpu_name:
-            print(f"   GPU: {gpu_name}")
-    except Exception:
-        pass
 
-    # 2) Upload(s)
-    input_files = ["/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/number plates/mercedes_number_plate.png"]
-    is_batch = False
-    
-    if is_batch and len(input_files) >= 1:
-        # Batch logic remains the same
-        test_batch(args.base_url, input_files)
+    if args.batch:
+        # For batch, we'll use a longer default wait time if the user doesn't specify one
+        batch_wait_time = args.wait if args.wait != 180.0 else 600.0
+        test_batch(args.base_url, args.files, max_wait=batch_wait_time)
     else:
-        # Single file logic
-        targets = input_files
-        for idx, path in enumerate(targets, start=2):
-            print(f"\n{idx}. Upload test")
-            # The variable `final_job_payload` will now correctly receive the result
-            final_job_payload = test_single_file(args.base_url, path)
-
-            # This `if` block will now work correctly
-            if final_job_payload and final_job_payload.get("status") == "done":
-                # Create a safe filename for the result
-                base_name = os.path.basename(path)
-                output_filename = f"result_{base_name}.json"
-                
-                with open(output_filename, "w", encoding="utf-8") as f:
-                    json.dump(final_job_payload, f, indent=2, ensure_ascii=False)
-                print(f"   💾 ✅ Final result saved to: {output_filename}")
-            elif final_job_payload:
-                print(f"   ❌ Job finished with status: {final_job_payload.get('status')}. Error: {final_job_payload.get('error')}")
-            else:
-                print("   ❌ Test function did not return a final job payload.")
-
-            # respect user-configured wait per job (poller uses its own default unless you tweak it)
-
-    # 3) poll a job
-    # print("\n2. Polling a sample job...")
-    # job_id = "a43b1d9d-7987-4266-92ae-4a9f560149bf"
-    # result = poll_job(args.base_url, job_id)
-    # print("   🎯 Final job payload:")
-    # print(json.dumps(result, indent=2, ensure_ascii=False))
+        for idx, path in enumerate(args.files, start=1):
+            print("-" * 20)
+            print(f"File {idx} of {len(args.files)}")
+            test_single_file(args.base_url, path, max_wait=args.wait)
 
     print("\n🎯 API Testing Complete!")
-    print("📱 Mobile app can connect to: http://YOUR_LAPTOP_IP:8000/api/")
 
 
 if __name__ == "__main__":

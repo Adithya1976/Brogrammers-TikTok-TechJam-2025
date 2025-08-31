@@ -17,9 +17,10 @@ class ImageProcessor:
         self.privacy_detector = privacy_detector
         self.object_detector = grounding_sam
         self.adversarial_noise_generator = AdversarialNoiseGenerator()
-    
+        self.image = None
+
     def to_png_b64(self, img: np.ndarray, is_mask=False) -> str:
-        # For masks: convert bool -> uint8 (0/255). You can also try 1-bit PNG (see note below).
+        # For masks: convert bool -> uint8 (0/255).
         if is_mask:
             img = (img.astype(np.uint8) * 255)
         ok, buf = cv2.imencode(".png", img)
@@ -28,66 +29,97 @@ class ImageProcessor:
         return base64.b64encode(buf).decode("ascii")
 
     def process_image(self, image_bytes: bytes, max_dimension: int = 720) -> dict:
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        (original_width, original_height) = image.size
+        original_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        (original_width, original_height) = original_image.size
 
         # --- Calculate processing dimensions ---
         if original_width > original_height:
-            # Landscape or square
             processing_width = max_dimension
             processing_height = int(original_height * (max_dimension / original_width))
         else:
-            # Portrait
             processing_height = max_dimension
             processing_width = int(original_width * (max_dimension / original_height))
         
         logging.info(f"Original resolution: {original_width}x{original_height}")
         logging.info(f"Processing at downscaled resolution: {processing_width}x{processing_height}")
 
-        # --- DOWNSAMPLE FRAME ---
-        image = image.resize((processing_width, processing_height))
+        # --- DOWNSAMPLE IMAGE for processing ---
+        image = original_image.resize((processing_width, processing_height))
 
-        # step 1: Object Detection
+        # --- Step 1 & 2: Detect objects and PII on the downscaled image ---
         object_detection_results = self.object_detector.process_image(image)
-        processed_image = object_detection_results["processed_image"]
-        object_detection_entities = object_detection_results["entities"]
-        # filter entity results to only entity_name and mask
         object_detection_entities = [{
             "entity_name": r["entity_name"],
             "mask": r["mask"]
-        } for r in object_detection_entities]
+        } for r in object_detection_results["entities"]]
 
-        # step 2: PII detection
-        privacy_detection_results = self.privacy_detector.process_image(processed_image)
-        # filter PII detection results
+        privacy_detection_results = self.privacy_detector.process_image(object_detection_results["processed_image"])
         privacy_detection_results = [{
             "entity_name": r["entity_name"],
-            "mask": r["mask"]
+            "mask": r["mask"] # mask is also a low-res numpy array
         } for r in privacy_detection_results]
 
         entities = object_detection_entities + privacy_detection_results
-        entities = [{
+        
+        # -----------------------------------------------------------------
+        # --- NEW & CRUCIAL STEP: Upsample all masks to original size ---
+        # -----------------------------------------------------------------
+        logging.info(f"Upsampling {len(entities)} masks to {original_width}x{original_height}...")
+        for entity in entities:
+            low_res_mask = entity["mask"] # This is a low-resolution boolean numpy array
+
+            # Convert boolean mask to uint8 (0 or 1) for cv2
+            low_res_mask_uint8 = low_res_mask.astype(np.uint8)
+
+            # Resize the mask. cv2.resize expects (width, height).
+            # INTER_NEAREST is essential for masks to avoid creating blurry
+            # intermediate values. It keeps the mask binary (0s and 1s).
+            high_res_mask_uint8 = cv2.resize(
+                low_res_mask_uint8,
+                (original_width, original_height),
+                interpolation=cv2.INTER_NEAREST
+            )
+            
+            # Convert back to boolean and update the entity's mask
+            entity["mask"] = high_res_mask_uint8 > 0
+
+        # Now, encode the newly upscaled masks to Base64
+        entities_encoded = [{
             "entity_name": e["entity_name"],
             "mask": self.to_png_b64(e["mask"], is_mask=True),
         } for e in entities]
 
-        # --- DOWNSAMPLE FRAME ---
-        image = image.resize((original_width, original_height))
 
-        # step 3: adversarial networks
-        # placeholder
-        # noise_induced_image = image
+        processed_image_pil = object_detection_results["processed_image"]
+        image_upsampled = processed_image_pil.resize((original_width, original_height))
+
+        # Step 3: Apply adversarial noise to the full-resolution image
         noise_induced_image = self.adversarial_noise_generator.apply_pgd_attack(
-             image=image,
+             image=image_upsampled,
              epsilon=0.007,
              iterations=20,
-             target_coords=(85.8, -176.15) # Example: Target the Arctic Ocean
+             target_coords=(85.8, -176.15)
         )
 
         result = {
             "processed_image": self.to_png_b64(np.array(noise_induced_image)),
             "shape": (original_width, original_height),
-            "entities": entities
+            "entities": entities_encoded
         }
-        
+
+        self.image = noise_induced_image
+
         return result
+
+if __name__ == "__main__":
+    input_file = "/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/resume.jpg"
+    labels = ["card"]
+    imageProcessor = ImageProcessor(PrivacyDetector(), GroundingDINO_SAMModel())
+    with open(input_file, "rb") as f:
+        image_bytes = f.read()
+    result = imageProcessor.process_image(image_bytes)
+
+    image = imageProcessor.image
+    output_file = "/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/resume_blurred.jpg"
+    image.save(output_file)
+    # print(result)

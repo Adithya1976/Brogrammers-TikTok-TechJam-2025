@@ -9,7 +9,11 @@ from typing import List, Dict, Any, Tuple
 from core.privacy_detector import PrivacyDetector
 from core.object_detector import GroundingDINO_SAMModel, DetectionResult, BoundingBox
 import time
+import os
+import uuid
 
+JOBS_DIR = "./jobs"
+os.makedirs(JOBS_DIR, exist_ok=True)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -290,45 +294,44 @@ def create_debug_video(
     cv2.destroyAllWindows()
 
 
-def upsample_entity_masks(entity_data: Dict[str, Any], original_width: int, original_height: int) -> Dict[str, Any]:
+def upsample_masks_for_entity(
+    masks: np.ndarray, 
+    original_width: int, 
+    original_height: int
+) -> np.ndarray:
     """
-    Upsamples the mask_video for each entity to the original video resolution.
+    Upsamples a stack of masks for a single entity to the original video resolution.
 
     Args:
-        entity_data (Dict[str, Any]): The data object from VideoProcessor.
+        masks (np.ndarray): The numpy array of low-resolution masks (num_masks, low_h, low_w).
         original_width (int): The original width of the video.
         original_height (int): The original height of the video.
 
     Returns:
-        The entity_data dictionary with masks scaled up.
+        np.ndarray: The upsampled masks.
     """
-    if not entity_data or not entity_data['entities']:
-        return entity_data
+    if not isinstance(masks, np.ndarray) or masks.ndim != 3:
+        logging.warning("Invalid mask format passed to upsampler. Skipping.")
+        return masks
 
-    logging.info(f"Upsampling masks to original resolution: {original_width}x{original_height}")
+    num_masks, low_h, low_w = masks.shape
     
-    for entity in entity_data['entities']:
-        low_res_masks = entity['mask_video']
-        num_masks, low_h, low_w = low_res_masks.shape
-        
-        # Skip if already at original resolution (or if something is wrong)
-        if low_h == original_height and low_w == original_width:
-            continue
+    # Skip if already at original resolution
+    if low_h == original_height and low_w == original_width:
+        return masks
 
-        # Create a new array to hold the upsampled masks
-        high_res_masks = np.zeros((num_masks, original_height, original_width), dtype=np.uint8)
-        
-        for i in range(num_masks):
-            # Use INTER_NEAREST for binary masks to avoid creating blurry grey values
-            high_res_masks[i] = cv2.resize(
-                low_res_masks[i],
-                (original_width, original_height),
-                interpolation=cv2.INTER_NEAREST
-            )
-        
-        entity['mask_video'] = high_res_masks
-        
-    return entity_data
+    # Create a new array to hold the upsampled masks
+    high_res_masks = np.zeros((num_masks, original_height, original_width), dtype=np.uint8)
+    
+    for i in range(num_masks):
+        # Use INTER_NEAREST for binary masks to avoid creating blurry grey values
+        high_res_masks[i] = cv2.resize(
+            masks[i],
+            (original_width, original_height),
+            interpolation=cv2.INTER_NEAREST
+        )
+    
+    return high_res_masks
 
 
 class VideoProcessor:
@@ -652,26 +655,51 @@ class VideoProcessor:
 
     def _finalize_output(self, tracked_entities: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Upscale (if needed) and structure the final output data.
-        Args:
-            tracked_entities (Dict[int, Dict[str, Any]]): The tracked entities data.
-        Returns:
-            Dict[str, Any]: The structured output data.
+        Structure the final output data, upsample masks, save them to disk,
+        and return metadata.
         """
         output_entities = []
-        upsampled_entities = upsample_entity_masks(entity_data=tracked_entities, original_width=self.video_info['width'], original_height=self.video_info['height']) # type: ignore
-        for entity_id, entity_data in upsampled_entities.items():
-            if not entity_data['masks']: continue
-            frame_nums, masks = zip(*entity_data['masks'])
-            mask_video = np.stack(masks, axis=0)
+        
+        original_width = self.video_info.get('width', 0)
+        original_height = self.video_info.get('height', 0)
+        if original_width == 0 or original_height == 0:
+            raise ValueError("Video dimensions not found. Processing cannot be finalized.")
 
-            # Add entity type to the final output
+        logging.info(f"Finalizing output and saving masks to disk...")
+
+        for entity_id, entity_data in tracked_entities.items():
+            if not entity_data.get('masks'):
+                continue
+            
+            frame_nums, low_res_masks_list = zip(*entity_data['masks'])
+            low_res_mask_video = np.stack([m.astype(np.uint8) for m in low_res_masks_list], axis=0)
+            
+            high_res_mask_video = upsample_masks_for_entity(
+                low_res_mask_video,
+                original_width,
+                original_height
+            )
+            
+            # --- THIS IS THE MAJOR CHANGE ---
+            # 1. Create a unique filename for the mask data.
+            mask_filename = f"mask_{entity_id}_{uuid.uuid4().hex}.npy"
+            mask_filepath = os.path.join(JOBS_DIR, mask_filename)
+
+            # 2. Save the numpy array to this file.
+            np.save(mask_filepath, high_res_mask_video)
+            logging.info(f"Saved mask for entity {entity_id} to {mask_filepath}")
+
+            # 3. Instead of the data, put the METADATA in the output.
             output_entities.append({
                 "entity_name": entity_data['label'],
+                "entity_id": entity_id,
                 "start_frame": min(frame_nums),
                 "end_frame": max(frame_nums),
-                "mask_video": base64.b64encode(mask_video.tobytes()).decode("ascii")
+                "mask_file": mask_filepath,  # Path to the saved mask
+                "mask_shape": high_res_mask_video.shape, # (frames, H, W)
+                "mask_dtype": str(high_res_mask_video.dtype) # e.g., 'uint8'
             })
+            # --- END OF MAJOR CHANGE ---
         
         return {
             "shape": (self.video_info['width'], self.video_info['height'], self.video_info['frame_count']),
@@ -696,7 +724,7 @@ class VideoProcessor:
 
 
 if __name__ == '__main__':
-    video_file_path = '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/videos/bedroom.mp4'
+    video_file_path = '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/videos/IMG_8420.MOV'
     labels_to_process = []
 
     start_time = time.time()
@@ -716,9 +744,9 @@ if __name__ == '__main__':
     for entity in individual_entity_data['entities']:
         print("-" * 20)
         print(f"  Entity ID: {entity['entity_id']}")
-        print(f"  Label: {entity['label']}")
+        print(f"  Name: {entity['entity_name']}")
         print(f"  Present from frame {entity['start_frame']} to {entity['end_frame']}")
-        print(f"  Mask Video Shape: {entity['mask_video'].shape}") # Should be (end-start+1, H, W) or similar
+        # print(f"  Mask Video Shape: {entity['mask_video'].shape}") # Should be (end-start+1, H, W) or similar
         print("-" * 20)
 
     # output_video_path = '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/videos/bedroom_processed.mp4'

@@ -38,7 +38,7 @@ app = FastAPI(
 grounding_sam = GroundingDINO_SAMModel()
 privacy_detector = PrivacyDetector()
 image_processor = ImageProcessor(grounding_sam=grounding_sam, privacy_detector=privacy_detector)
-video_processor = VideoProcessor(grounding_sam=grounding_sam, privacy_detector=privacy_detector)
+video_processor = VideoProcessor(grounding_sam=grounding_sam)
 storage = ProcessingResult()
 
 JOBS_DIR = "./jobs"

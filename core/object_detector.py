@@ -57,7 +57,7 @@ class GroundingDINO_SAMModel:
     A class for Grounding DINO with SAM (Segment Anything Model) integration.
     Models are loaded once during initialization for efficient video processing.
     """
-    def __init__(self, device: torch.device | None = None):
+    def __init__(self, device: torch.device | None = None, labels: List[str] | None = None):
         if device is None:
             self.device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
         else:
@@ -67,7 +67,7 @@ class GroundingDINO_SAMModel:
         dino_model_name = "IDEA-Research/grounding-dino-tiny"
         sam_model_name = "facebook/sam-vit-base"
 
-        # --- MODIFICATION: Load DINO processor and model directly, instead of using pipeline ---
+        self.object_detector = pipeline(model=dino_model_name, task="zero-shot-object-detection", device=self.device)
         self.dino_processor = AutoProcessor.from_pretrained(dino_model_name)
         self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_model_name).to(self.device)
         
@@ -77,15 +77,33 @@ class GroundingDINO_SAMModel:
 
         # Set default labels for detection (if none are provided)
         self.default_labels = ["person", "license plate", "card", "sign"]
+        if labels is not None:
+            self.default_labels = labels
 
     def detect(self, image: Image.Image, labels: List[str], score_threshold: float = 0.25) -> List[DetectionResult]:
         """
-        Runs Grounding DINO on a single image. This is now a convenience wrapper
-        around the more powerful detect_batch method.
+        Runs Grounding DINO on the given image.
+
+        Args:
+            image (Image.Image): The image to process.
+            labels (List[str]): The text labels for detection.
+            score_threshold (float): The score threshold for filtering detections.
+
+        Returns:
+            A list of DetectionResult objects.
         """
-        # Simply call the batch method with a single image and return the first result
-        batch_results = self.detect_batch([image], labels, score_threshold)
-        return batch_results[0] if batch_results else []
+        if not labels:
+            labels = self.default_labels
+
+        # Ensure labels end with a dot for better performance
+        processed_labels = [label if label.endswith(".") else label + "." for label in labels]
+        
+        results = self.object_detector(image, candidate_labels=processed_labels, threshold=score_threshold)
+        detections = [DetectionResult.from_dict(result) for result in results]
+
+        # Store these detections for the segment method to use
+        self.detections = detections
+        return self.detections
     
     def segment(self, image: Image.Image, detections: List[DetectionResult]) -> List[DetectionResult] | None:
         """
@@ -176,18 +194,23 @@ class GroundingDINO_SAMModel:
 
         return image
 
-    def blur_objects_in_image(self, image: Image.Image, detections: List[DetectionResult], radius: int = 25) -> Image.Image:
+    def blur_objects_in_image(self, image: Image.Image, detections: List[DetectionResult], radius: int = 25, strength: float = 2.0, mask_blur: int | None = None) -> Image.Image:
         """
         Blurs the objects in the image based on the detected masks.
 
         Args:
-            radius (int): The radius of the blur effect.
+            radius (int): Base radius of the Gaussian blur.
+            strength (float): Multiplier for the blur strength (1.0 = base radius, 2.0 = twice as strong).
+            mask_blur (int | None): Radius used to feather the mask edges. If None it's derived from radius*strength.
 
         Returns:
             The final image with blurred objects.
         """
-        # 1. Create a fully blurred version of the original image
-        blurred_image = image.filter(ImageFilter.GaussianBlur(radius=radius))
+        # Determine effective blur radius
+        effective_radius = max(1, int(radius * max(0.0, strength)))
+
+        # 1. Create a fully blurred version of the original image with the effective radius
+        blurred_image = image.filter(ImageFilter.GaussianBlur(radius=effective_radius))
 
         # 2. Create a combined mask for all detected objects
         combined_mask_np = np.zeros(np.array(image).shape[:2], dtype=np.uint8)
@@ -198,14 +221,18 @@ class GroundingDINO_SAMModel:
         for detection in detections:
             if detection.mask is None:
                 continue
-
-            # Combine the current object's mask with the master mask.
             combined_mask_np = np.maximum(combined_mask_np, detection.mask)
 
-        # 3. Convert the combined NumPy mask back to a PIL Image
+        # 3. Convert the combined NumPy mask back to a PIL Image (0-255)
         combined_mask_pil = Image.fromarray((combined_mask_np * 255).astype(np.uint8), mode='L')
 
-        # 4. Composite the blurred image onto the original using the combined mask
+        # 4. Feather (soften) the mask to avoid harsh edges; use provided mask_blur or derive it
+        if mask_blur is None:
+            mask_blur = max(1, int(effective_radius / 2))
+        if mask_blur > 0:
+            combined_mask_pil = combined_mask_pil.filter(ImageFilter.GaussianBlur(radius=mask_blur))
+
+        # 5. Composite the blurred image onto the original using the feathered mask
         final_image = Image.composite(blurred_image, image, combined_mask_pil)
 
         return final_image
@@ -335,22 +362,11 @@ class GroundingDINO_SAMModel:
         return all_segmented_results
 
 
-
-
-
-
-
 # Example Workflow
 if __name__ == "__main__":
     # Ensure your dataclasses and detect/draw_on_image functions are defined
-    
-    image_paths = ['/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/number plates/mercedes_number_plate.png',
-                   '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/signboards/christophe-leemans-odmMdVmicgY-unsplash.jpg',
-                   '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/signboards/govind-krishnan-uZPwtq5E2go-unsplash.jpg',
-                   '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/signboards/kait-herzog-6vWD_xnzPuU-unsplash.jpg',
-                   '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/signboards/hamid-roshaan-IGVGEFQHczg-unsplash.jpg',
-                   '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/people/windows-p74ndnYWRY4-unsplash.jpg'
-                   ]
+
+    image_path = '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/people/windows-p74ndnYWRY4-unsplash.jpg'
 
     # try:
     #     image = Image.open(image_path).convert("RGB")
@@ -401,19 +417,39 @@ if __name__ == "__main__":
 
     # Another Example
 
-    input_labels = ["person", "license plate", "sign"]
+    input_labels = ["face", "sign"]
 
-    images = []
-    for image_path in image_paths:
-        image = Image.open(image_path).convert("RGB")
-        image = ImageOps.exif_transpose(image)  # handle exif orientation
-        images.append(image)
+    image = Image.open(image_path).convert("RGB")
+    image = ImageOps.exif_transpose(image)  # handle exif orientation
 
     groundingSAM = GroundingDINO_SAMModel()
 
     # 1. Detect objects with GroundingDINO
     print("Step 1: Detecting objects...")
-    detections = groundingSAM.detect_batch(images=images, labels=input_labels, score_threshold=0.3)
+    detections = groundingSAM.detect(image=image, labels=input_labels, score_threshold=0.3)
 
-    # 2. Segment detected objects with SAM
-    segmented_detections = groundingSAM.segment_batch(images=images, detections_batch=detections)
+    if not detections:
+        print("No objects detected. Exiting.")
+    else:
+        for detection in detections:
+            print(detection)
+
+        # Draw original bounding boxes for comparison
+        bbox_image = groundingSAM.draw_on_image(image, detections)
+        print("Showing image with original bounding boxes...")
+        bbox_image.show()
+
+        # 2. Segment the detected objects with SAM
+        print("\nStep 2: Segmenting detected objects...")
+        segmented_detections = groundingSAM.segment(image=image, detections=detections)
+
+        # 3. Apply the blur effect using the generated masks
+        print("\nStep 3: Applying blur effect...")
+        blurred_image = groundingSAM.blur_objects_in_image(image, segmented_detections)
+
+        print("Showing final image with blurred objects...")
+        blurred_image.show()
+
+        # Save the final image
+        output_path = '/Users/nipunsamudrala/workspace/coding projects/python projects/ImageClassification/images/people/windows-p74ndnYWRY4-unsplash_blurred.jpg'
+        blurred_image.save(output_path)
